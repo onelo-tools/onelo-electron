@@ -6,7 +6,48 @@ import type { OneloElectronConfig, OneloElectronSession, OneloElectronUser, Reso
 import { OneloError } from './types'
 import { generateAuthViewHtml } from './auth-view-html'
 import { sdkHeaders } from './sdk-headers'
+import { getCachedCodesignFingerprint } from './codesign'
 import type { OneloEventStream } from './event-stream'
+
+// ── flowErrorHtml ────────────────────────────────────────────────────────────
+
+/**
+ * Graceful error page shown in the auth window when the flow can't be resolved
+ * (#31 — e.g. a hard backend reject: attestation / codesign / bundle-id mismatch
+ * → 403, or store misconfig). Previously `presentAuthWindow` threw WITHOUT ever
+ * opening a window, so a naive host (`await presentAuthWindow(); mainWindow.show()`)
+ * hit an UnhandledPromiseRejection and the main window (`show:false`) stayed
+ * hidden → blank app. Parity with Flutter `auth_view` `_errorScaffold` (#30) and
+ * RN's retry screen.
+ *
+ * Hard-coded dark #111111 (NOT the branding bg) — matches Flutter's error scaffold
+ * and guarantees the white "Try again" button stays legible even if a tenant set a
+ * light checkout background. The technical reason is logged to the console (see
+ * presentAuthWindow); the on-screen copy stays generic so end users never see a raw
+ * "bundle_id_mismatch". The "Try again" button navigates the `onelo-retry://`
+ * sentinel, intercepted by `will-navigate` exactly like the deep-link scheme.
+ */
+function flowErrorHtml(): string {
+  return `<!DOCTYPE html><html><head>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{background:#111111;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;display:flex;align-items:center;justify-content:center;padding:32px;color:rgba(255,255,255,0.92)}
+.card{max-width:340px;text-align:center}
+.title{font-size:17px;font-weight:600;margin-bottom:8px}
+.msg{font-size:13px;line-height:1.5;color:rgba(255,255,255,0.55);margin-bottom:24px}
+button{font:inherit;font-size:14px;font-weight:600;padding:11px 24px;border-radius:10px;border:none;background:#ffffff;color:#111111;cursor:pointer}
+button:hover{opacity:0.9}
+button:focus-visible{outline:2px solid #ffffff;outline-offset:2px}
+</style></head><body>
+<div class="card">
+<div class="title">Couldn't start sign-in</div>
+<div class="msg">Something went wrong while connecting. Please check your connection and try again.</div>
+<button onclick="location.href='onelo-retry://retry'">Try again</button>
+</div>
+</body></html>`
+}
 
 // ── resolveConfig ────────────────────────────────────────────────────────────
 
@@ -108,6 +149,9 @@ export class OneloElectronAuth {
   isReady = false
   /** True if the publishable key has been revoked */
   isRevoked = false
+  /** #29 — non-null when `initialize()` threw; previously swallowed silently
+   *  (isReady=false forever with no trace). Surfaced + logged for diagnosis. */
+  initError: string | null = null
   /** Whether the tenant's plan allows custom auth UI */
   allowCustomBranding = false
   /** App name from dashboard — shown in hosted sign-in UI */
@@ -125,6 +169,19 @@ export class OneloElectronAuth {
     this.publishableKey = config.publishableKey
     this.clientSecret = config.clientSecret
     this.bundleId = config.bundleId
+    // #18 DX: X-Bundle-Id is only sent when bundleId is set. A code-SIGNED
+    // Electron build without it will be rejected (bundle_id_mismatch 403) on
+    // every request once enforcement is active (live app, or an open discovery
+    // window with a registered bundle). Surface it LOUDLY at init instead of a
+    // silent 403 much later. (Unsigned dev builds aren't enforced, so no noise.)
+    if (!this.bundleId && getCachedCodesignFingerprint()) {
+      console.warn(
+        '[Onelo] This build is code-signed but no `bundleId` is set in your Onelo config. ' +
+        'Set `bundleId` to your app id (e.g. "com.company.app") — it is REQUIRED for codesign ' +
+        'attestation. Without it, requests are rejected with bundle_id_mismatch (403) once ' +
+        'enforcement is active.',
+      )
+    }
     this.initPromise = this.initialize()
   }
 
@@ -142,10 +199,19 @@ export class OneloElectronAuth {
       this.oauthProviders = resolved.oauthProviders ?? []
       this.isReady = true
     } catch (e) {
+      // #29 — NEVER swallow silently (CLAUDE.md "No silent swallows"). A failed
+      // init used to vanish here (isReady=false forever, no trace). Surface it so
+      // the real cause reaches the console instead of a mysterious dead SDK.
+      const msg = e instanceof Error ? e.message : String(e)
+      this.initError = msg
+      console.warn(
+        '[Onelo] SDK initialization failed — auth and config-gated features are ' +
+        'disabled until this is fixed: ' + msg,
+      )
       if (e instanceof OneloError && e.code === 'invalid_publishable_key') {
         this.isRevoked = true
       }
-      // Network error — fall back to cached session if available
+      // Otherwise (e.g. transient network) a cached session may still be usable.
     }
   }
 
@@ -274,6 +340,30 @@ export class OneloElectronAuth {
         // fail-open — already cleared locally
       }
     }
+  }
+
+  /**
+   * Instant, SYNCHRONOUS presence check for a locally stored session. Unlike
+   * `getSession()` it does NOT await init (`whenReady()`) — no `/api/sdk/config`
+   * round-trip — and never touches the network. It is a pure secure-store
+   * presence read (access + refresh + user tokens all present), so the host app
+   * / window logic can decide AT COLD START, before init resolves, whether a
+   * launch is an auto-login (keep the hidden main window hidden while restore
+   * runs, or paint the branded auth window) or a genuine signed-out start.
+   * Parity with Android `hasStoredSession()` and Swift `hasStoredSessionSync()`
+   * (#36).
+   *
+   * This is an optimistic hint, NOT validation: it does not check token expiry or
+   * server-side revocation. Always drive real access off `getSession()` (expiry →
+   * refresh) — that enforcement path is unchanged. Mirrors the same three-token
+   * completeness check `getSession()` requires before returning a session.
+   */
+  hasStoredSession(): boolean {
+    return this.storage.hasKeysSync(
+      TOKEN_KEYS.ACCESS_TOKEN,
+      TOKEN_KEYS.REFRESH_TOKEN,
+      TOKEN_KEYS.USER_JSON,
+    )
   }
 
   async getSession(): Promise<OneloElectronSession | null> {
@@ -443,7 +533,7 @@ export class OneloElectronAuth {
       // plan-accurate error so the app routes the buyer to the store/upgrade,
       // never "account suspended" (parity with Swift + JS).
       if (reason === 'no_plan_available') {
-        throw OneloError.planRequired()
+        throw OneloError.noActivePlan()
       }
       // benign (session_expired / session_invalid) → just clear + null.
       return null
@@ -461,12 +551,35 @@ export class OneloElectronAuth {
    * Handles the deep-link callback automatically — no app.on('open-url') needed.
    * Works on both free and paid plans. On free plan the hosted page includes Onelo branding.
    *
+   * A hard flow-resolve failure (attestation / codesign / bundle-id mismatch →
+   * 403, store misconfig, offline) is NOT thrown — it opens a graceful error
+   * window with "Try again" and resolves `null` if the user closes it (#31).
+   * The ONLY case that still throws is a REVOKED publishable key
+   * (`OneloError.invalidKey`) — a permanent developer misconfig where retry is
+   * meaningless — so wrap this call in try/catch (the auth-gate snippet does).
+   *
    * @param parentWindow  Optional parent BrowserWindow (for modal centering)
+   * @throws {OneloError} `invalid_publishable_key` if the app key is revoked.
    */
-  async presentAuthWindow(parentWindow?: import('electron').BrowserWindow): Promise<OneloElectronSession | null> {
+  async presentAuthWindow(parentWindow?: import('electron').BrowserWindow | null): Promise<OneloElectronSession | null> {
     await this.waitReady()
     if (this.isRevoked) throw OneloError.invalidKey('Application key has been revoked')
-    const decision = await this.resolveFlow()
+    let decision: Awaited<ReturnType<typeof this.resolveFlow>>
+    try {
+      decision = await this.resolveFlow()
+    } catch (err) {
+      // #31 — resolveFlow throws on a hard backend reject (attestation / codesign
+      // / bundle-id mismatch → 403, store misconfig, invalid flow response).
+      // Previously this escaped WITHOUT ever opening a window, so a naive host
+      // (`await presentAuthWindow(); mainWindow.show()`) hit an
+      // UnhandledPromiseRejection and the main window (`show:false`) stayed hidden
+      // → blank app. Instead: log the technical reason (never swallow — memory
+      // feedback_no_silent_swallows) and open a window with a graceful error +
+      // "Try again". Parity with Flutter `_errorScaffold` (#30) / RN retry.
+      const reason = err instanceof OneloError ? err.message : String(err)
+      console.warn('[Onelo] Auth flow could not be resolved — showing retry UI: ' + reason)
+      return this.presentFlowError(parentWindow)
+    }
     if (decision.action === 'authorized') {
       // Backend confirmed access via a LIVE entitlement check — do NOT open a
       // window. Sync the cached entitlement so hasActiveAccess() agrees, then
@@ -491,7 +604,7 @@ export class OneloElectronAuth {
    */
   async presentHostedUrl(
     hostedUrl: string,
-    parentWindow?: import('electron').BrowserWindow,
+    parentWindow?: import('electron').BrowserWindow | null,
     title?: string,
   ): Promise<OneloElectronSession | null> {
     return new Promise((resolve, reject) => {
@@ -508,11 +621,15 @@ export class OneloElectronAuth {
           height: 720,
           minWidth: 440,
           minHeight: 680,
-          parent: parentWindow,
+          parent: parentWindow ?? undefined,
           modal: !!parentWindow,
           resizable: true,
           minimizable: false,
           maximizable: false,
+          // #26 — paint the branding page background (checkout_bg_color, default
+          // #111111) so the window doesn't flash white before the hosted page
+          // paints. Parity with the customer-portal window (customer-portal.ts).
+          backgroundColor: this.resolvedConfig?.pageBackgroundColor ?? '#111111',
           webPreferences: { nodeIntegration: false, contextIsolation: true },
           title: title ?? this.appName ?? 'Sign in',
         })
@@ -615,6 +732,81 @@ export class OneloElectronAuth {
 
         win.on('closed', () => {
           resolve(null)
+        })
+      }).catch(reject)
+    })
+  }
+
+  /**
+   * #31 — Present a graceful error window with a "Try again" button when the auth
+   * flow can't be resolved (attestation / codesign / bundle-id mismatch → 403,
+   * store misconfig, offline). Called by presentAuthWindow's catch so a hard
+   * reject shows UI instead of throwing without a window. Parity with Flutter
+   * `_errorScaffold` (#30) and RN's retry screen.
+   *
+   * Resolves with the eventual session if the user hits "Try again" and the retry
+   * succeeds, or `null` if they close the window (same "no session" contract as
+   * presentHostedUrl closing without a code).
+   */
+  private presentFlowError(
+    parentWindow?: import('electron').BrowserWindow | null,
+  ): Promise<OneloElectronSession | null> {
+    return new Promise((resolve, reject) => {
+      import('electron').then(({ BrowserWindow }) => {
+        const win = new BrowserWindow({
+          // Same enforced floor as the hosted auth window (presentHostedUrl) so the
+          // error/retry state doesn't render in an oddly-sized window.
+          width: 480,
+          height: 720,
+          minWidth: 440,
+          minHeight: 680,
+          parent: parentWindow ?? undefined,
+          modal: !!parentWindow,
+          resizable: true,
+          minimizable: false,
+          maximizable: false,
+          // Hard #111111 (NOT branding bg) — the error page is #111111 and the white
+          // "Try again" button must stay legible; matches Flutter's error scaffold.
+          backgroundColor: '#111111',
+          webPreferences: { nodeIntegration: false, contextIsolation: true },
+          title: this.appName ?? 'Sign in',
+        })
+
+        win.setMenuBarVisibility(false)
+        win.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(flowErrorHtml()))
+          .catch(() => { if (!win.isDestroyed()) win.close() })
+
+        // "Try again" navigates the onelo-retry:// sentinel (button sets
+        // location.href → fires will-navigate, same interception pattern as the
+        // deep-link scheme in presentHostedUrl). We re-run the WHOLE flow: close
+        // this window and call presentAuthWindow again, chaining its result so the
+        // caller's original await settles with the retried outcome. `retrying`
+        // stops the 'closed' handler from resolving null when WE close the window.
+        let retrying = false
+        const onRetry = (event: Electron.Event, url: string): void => {
+          if (!url.startsWith('onelo-retry://')) return
+          event.preventDefault()
+          retrying = true
+          win.webContents.removeListener('will-redirect', onRetry)
+          win.webContents.removeListener('will-navigate', onRetry)
+          win.close()
+          this.presentAuthWindow(parentWindow).then(resolve).catch(reject)
+        }
+        win.webContents.on('will-redirect', onRetry)
+        win.webContents.on('will-navigate', onRetry)
+
+        // External links (none expected on the error page, but keep parity — never
+        // let a navigation open inside the chromeless window).
+        win.webContents.setWindowOpenHandler(({ url }) => {
+          import('electron').then(({ shell }) => shell.openExternal(url))
+          return { action: 'deny' }
+        })
+
+        win.on('closed', () => {
+          // User closed the error window without retrying → no session (null),
+          // same contract as presentHostedUrl. A retry-triggered close is flagged
+          // so it doesn't double-settle the promise.
+          if (!retrying) resolve(null)
         })
       }).catch(reject)
     })
@@ -724,7 +916,7 @@ export class OneloElectronAuth {
    * @param parentWindow  Optional parent BrowserWindow (centers/modals the auth window).
    * @returns             Resolves with a session after successful sign-in or sign-up.
    */
-  async loadAuthView(parentWindow?: import('electron').BrowserWindow): Promise<OneloElectronSession | null> {
+  async loadAuthView(parentWindow?: import('electron').BrowserWindow | null): Promise<OneloElectronSession | null> {
     await this.waitReady()
     if (this.isRevoked) throw OneloError.invalidKey('Application key has been revoked')
 
@@ -744,7 +936,7 @@ export class OneloElectronAuth {
           height: 680,
           minWidth: 440,
           minHeight: 640,
-          parent: parentWindow,
+          parent: parentWindow ?? undefined,
           modal: !!parentWindow,
           resizable: true,
           minimizable: false,

@@ -1,13 +1,23 @@
 import { execSync } from 'child_process'
+import { createHash } from 'crypto'
+import { readFileSync, unlinkSync } from 'fs'
+import { tmpdir } from 'os'
+import { join } from 'path'
 
 /**
- * Computes the SHA-256 fingerprint of the app's codesign certificate.
+ * Computes the SHA-256 fingerprint of the app's code-signing CERTIFICATE
+ * (the signing identity), stable across rebuilds while that identity is unchanged.
  *
- * macOS: uses `codesign -dv --verbose=4` and parses the SHA-256 line.
- * Windows: uses PowerShell `Get-AuthenticodeSignature` to extract the cert thumbprint.
- * Linux: returns null (codesign not applicable).
+ * macOS: extracts the leaf signing cert via `codesign --extract-certificates`
+ *   and SHA-256s its DER — NOT the `codesign -dv` CDHash, which is a hash of the
+ *   binary's code pages and changes on every rebuild (would break TOFU per release).
+ * Windows: PowerShell `Get-AuthenticodeSignature` → signer-cert thumbprint.
+ * Linux: returns null (no standard code signing).
  *
- * Returns the fingerprint as a lowercase hex string, or null on any error.
+ * Both platforms return a lowercase 64-char hex string via the SAME algorithm
+ * (SHA-256 of the signing cert's DER), or null on any error. The certs
+ * themselves differ per OS (macOS Developer ID vs Windows Authenticode), which
+ * is why each OS registers its own fingerprint.
  */
 export function getCodesignFingerprint(): string | null {
   try {
@@ -23,16 +33,26 @@ export function getCodesignFingerprint(): string | null {
 }
 
 function getMacOSFingerprint(): string | null {
+  // codesign writes the cert chain to <prefix>0 (leaf), <prefix>1, … in DER.
+  const prefix = join(tmpdir(), `onelo-cs-${process.pid}-${Date.now()}-`)
   try {
-    const output = execSync(
-      `codesign -dv --verbose=4 "${process.execPath}" 2>&1`,
-      { encoding: 'utf8', timeout: 5000 }
+    execSync(
+      `codesign -d --extract-certificates="${prefix}" "${process.execPath}" 2>/dev/null`,
+      { timeout: 5000 }
     )
-    const match = output.match(/SHA-256=([0-9A-Fa-f]+)/)
-    if (!match) return null
-    return match[1].toLowerCase()
+    const der = readFileSync(`${prefix}0`) // leaf signing certificate
+    return createHash('sha256').update(der).digest('hex').toLowerCase()
   } catch {
     return null
+  } finally {
+    // Best-effort cleanup of the extracted cert-chain files.
+    for (let i = 0; i < 8; i++) {
+      try {
+        unlinkSync(`${prefix}${i}`)
+      } catch {
+        /* file not present — stop */
+      }
+    }
   }
 }
 
@@ -63,4 +83,16 @@ export function getCachedCodesignFingerprint(): string | null {
     _cachedFingerprint = getCodesignFingerprint()
   }
   return _cachedFingerprint
+}
+
+/**
+ * The runtime OS this build is signed for, in the backend's vocabulary
+ * ('macos' | 'windows'), or null on Linux/other. Sent as `X-Codesign-Platform`
+ * so an auto-registered fingerprint is tagged with the OS it came from — the
+ * dashboard shows this per fingerprint instead of a generic label.
+ */
+export function getCodesignOS(): 'macos' | 'windows' | null {
+  if (process.platform === 'darwin') return 'macos'
+  if (process.platform === 'win32') return 'windows'
+  return null
 }

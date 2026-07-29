@@ -51,8 +51,22 @@ var require_types = __commonJS({
       static hostedFlowRequired() {
         return new _OneloError("hosted_flow_required", "This app requires the hosted sign-in flow. Use loadAuthView().");
       }
+      /**
+       * The DEVELOPER's app is on a plan that doesn't allow custom auth UI. This is
+       * a build-time configuration error — the fix is to use the hosted flow
+       * (loadAuthView) or upgrade the Onelo plan. NOT for an end-user's lapsed
+       * subscription — see noActivePlan().
+       */
       static planRequired() {
         return new _OneloError("plan_required", "[plan_required] Custom UI requires a paid Onelo plan. Use loadAuthView() instead.");
+      }
+      /**
+       * The END USER has no active subscription (it lapsed or was cancelled) — the
+       * backend cleared the session. This is NOT a config error and NOT an account
+       * revocation: route the user to your store / upgrade flow to re-subscribe.
+       */
+      static noActivePlan() {
+        return new _OneloError("no_active_plan", "[no_active_plan] No active subscription \u2014 the plan has expired or was cancelled. Route the user to your store / upgrade flow to re-subscribe.");
       }
       static invalidKey(msg) {
         return new _OneloError("invalid_publishable_key", `Invalid publishable key: ${msg}`);
@@ -276,16 +290,23 @@ function getCodesignFingerprint() {
   }
 }
 function getMacOSFingerprint() {
+  const prefix = (0, import_path2.join)((0, import_os.tmpdir)(), `onelo-cs-${process.pid}-${Date.now()}-`);
   try {
-    const output = (0, import_child_process.execSync)(
-      `codesign -dv --verbose=4 "${process.execPath}" 2>&1`,
-      { encoding: "utf8", timeout: 5e3 }
+    (0, import_child_process.execSync)(
+      `codesign -d --extract-certificates="${prefix}" "${process.execPath}" 2>/dev/null`,
+      { timeout: 5e3 }
     );
-    const match = output.match(/SHA-256=([0-9A-Fa-f]+)/);
-    if (!match) return null;
-    return match[1].toLowerCase();
+    const der = (0, import_fs2.readFileSync)(`${prefix}0`);
+    return (0, import_crypto.createHash)("sha256").update(der).digest("hex").toLowerCase();
   } catch {
     return null;
+  } finally {
+    for (let i = 0; i < 8; i++) {
+      try {
+        (0, import_fs2.unlinkSync)(`${prefix}${i}`);
+      } catch {
+      }
+    }
   }
 }
 function getWindowsFingerprint() {
@@ -310,11 +331,20 @@ function getCachedCodesignFingerprint() {
   }
   return _cachedFingerprint;
 }
-var import_child_process, _cachedFingerprint;
+function getCodesignOS() {
+  if (process.platform === "darwin") return "macos";
+  if (process.platform === "win32") return "windows";
+  return null;
+}
+var import_child_process, import_crypto, import_fs2, import_os, import_path2, _cachedFingerprint;
 var init_codesign = __esm({
   "src/codesign.ts"() {
     "use strict";
     import_child_process = require("child_process");
+    import_crypto = require("crypto");
+    import_fs2 = require("fs");
+    import_os = require("os");
+    import_path2 = require("path");
     _cachedFingerprint = void 0;
   }
 });
@@ -360,7 +390,7 @@ var init_instance_id = __esm({
 var version;
 var init_package = __esm({
   "package.json"() {
-    version = "0.36.0-staging";
+    version = "0.37.1-staging";
   }
 });
 
@@ -373,6 +403,7 @@ function sdkHeaders(bundleIdOrExtra, extra) {
   const bundleId = typeof bundleIdOrExtra === "string" ? bundleIdOrExtra : void 0;
   const extraHeaders = typeof bundleIdOrExtra === "object" ? bundleIdOrExtra : extra;
   const fp = getCachedCodesignFingerprint();
+  const codesignOS = fp ? getCodesignOS() : null;
   return {
     "X-SDK-Version": version,
     // Platform attribution for feature discovery. Without this, rows registered
@@ -395,6 +426,7 @@ function sdkHeaders(bundleIdOrExtra, extra) {
     "X-Onelo-Instance-Id": getInstanceId(),
     ...bundleId ? { "X-Bundle-Id": bundleId } : {},
     ...fp ? { "X-Codesign-Fingerprint": fp } : {},
+    ...codesignOS ? { "X-Codesign-Platform": codesignOS } : {},
     ...extraHeaders
   };
 }
@@ -431,7 +463,7 @@ __export(index_exports, {
 module.exports = __toCommonJS(index_exports);
 
 // src/auth.ts
-var import_path2 = __toESM(require("path"));
+var import_path3 = __toESM(require("path"));
 var import_core2 = __toESM(require_dist());
 
 // src/storage.ts
@@ -502,6 +534,28 @@ var SecureTokenStorage = class {
     this.cache.clear();
     const path2 = this.getStorePath();
     if ((0, import_fs.existsSync)(path2)) (0, import_fs.writeFileSync)(path2, "{}", "utf-8");
+  }
+  /**
+   * Synchronous presence check for one or more stored keys, WITHOUT decrypting.
+   * Reads the raw encrypted store straight off disk (`readFileSync`) and reports
+   * whether EVERY requested key is present. Backs the cold-start
+   * `hasStoredSession()` primitive (#36): a fast, init-independent "am I logged
+   * in?" hint. Deliberately checks key presence only (no `decryptString`) so it
+   * never depends on the OS keychain being unlockable and never throws.
+   * The on-disk file is the source of truth — `set`/`delete`/`clear` all persist
+   * synchronously, so this stays consistent with the async accessors.
+   * Returns false if the store file is missing, empty, or unreadable.
+   */
+  hasKeysSync(...keys) {
+    if (keys.length === 0) return false;
+    const path2 = this.getStorePath();
+    if (!(0, import_fs.existsSync)(path2)) return false;
+    try {
+      const raw = JSON.parse((0, import_fs.readFileSync)(path2, "utf-8"));
+      return keys.every((k) => Object.prototype.hasOwnProperty.call(raw, k));
+    } catch {
+      return false;
+    }
   }
 };
 
@@ -798,6 +852,28 @@ function generateAuthViewHtml() {
 
 // src/auth.ts
 init_sdk_headers();
+init_codesign();
+function flowErrorHtml() {
+  return `<!DOCTYPE html><html><head>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{background:#111111;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;display:flex;align-items:center;justify-content:center;padding:32px;color:rgba(255,255,255,0.92)}
+.card{max-width:340px;text-align:center}
+.title{font-size:17px;font-weight:600;margin-bottom:8px}
+.msg{font-size:13px;line-height:1.5;color:rgba(255,255,255,0.55);margin-bottom:24px}
+button{font:inherit;font-size:14px;font-weight:600;padding:11px 24px;border-radius:10px;border:none;background:#ffffff;color:#111111;cursor:pointer}
+button:hover{opacity:0.9}
+button:focus-visible{outline:2px solid #ffffff;outline-offset:2px}
+</style></head><body>
+<div class="card">
+<div class="title">Couldn't start sign-in</div>
+<div class="msg">Something went wrong while connecting. Please check your connection and try again.</div>
+<button onclick="location.href='onelo-retry://retry'">Try again</button>
+</div>
+</body></html>`;
+}
 async function resolveConfig(publishableKey, apiUrl, codeChallenge, clientSecret) {
   if (!publishableKey.startsWith("onelo_pk_")) {
     throw import_core.OneloError.invalidKey("Key must start with onelo_pk_");
@@ -848,6 +924,9 @@ var _OneloElectronAuth = class _OneloElectronAuth {
     this.isReady = false;
     /** True if the publishable key has been revoked */
     this.isRevoked = false;
+    /** #29 — non-null when `initialize()` threw; previously swallowed silently
+     *  (isReady=false forever with no trace). Surfaced + logged for diagnosis. */
+    this.initError = null;
     /** Whether the tenant's plan allows custom auth UI */
     this.allowCustomBranding = false;
     /** App name from dashboard — shown in hosted sign-in UI */
@@ -863,6 +942,11 @@ var _OneloElectronAuth = class _OneloElectronAuth {
     this.publishableKey = config.publishableKey;
     this.clientSecret = config.clientSecret;
     this.bundleId = config.bundleId;
+    if (!this.bundleId && getCachedCodesignFingerprint()) {
+      console.warn(
+        '[Onelo] This build is code-signed but no `bundleId` is set in your Onelo config. Set `bundleId` to your app id (e.g. "com.company.app") \u2014 it is REQUIRED for codesign attestation. Without it, requests are rejected with bundle_id_mismatch (403) once enforcement is active.'
+      );
+    }
     this.initPromise = this.initialize();
   }
   /**
@@ -905,6 +989,11 @@ var _OneloElectronAuth = class _OneloElectronAuth {
       this.oauthProviders = resolved.oauthProviders ?? [];
       this.isReady = true;
     } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      this.initError = msg;
+      console.warn(
+        "[Onelo] SDK initialization failed \u2014 auth and config-gated features are disabled until this is fixed: " + msg
+      );
       if (e instanceof import_core.OneloError && e.code === "invalid_publishable_key") {
         this.isRevoked = true;
       }
@@ -1023,6 +1112,29 @@ var _OneloElectronAuth = class _OneloElectronAuth {
       } catch {
       }
     }
+  }
+  /**
+   * Instant, SYNCHRONOUS presence check for a locally stored session. Unlike
+   * `getSession()` it does NOT await init (`whenReady()`) — no `/api/sdk/config`
+   * round-trip — and never touches the network. It is a pure secure-store
+   * presence read (access + refresh + user tokens all present), so the host app
+   * / window logic can decide AT COLD START, before init resolves, whether a
+   * launch is an auto-login (keep the hidden main window hidden while restore
+   * runs, or paint the branded auth window) or a genuine signed-out start.
+   * Parity with Android `hasStoredSession()` and Swift `hasStoredSessionSync()`
+   * (#36).
+   *
+   * This is an optimistic hint, NOT validation: it does not check token expiry or
+   * server-side revocation. Always drive real access off `getSession()` (expiry →
+   * refresh) — that enforcement path is unchanged. Mirrors the same three-token
+   * completeness check `getSession()` requires before returning a session.
+   */
+  hasStoredSession() {
+    return this.storage.hasKeysSync(
+      import_core2.TOKEN_KEYS.ACCESS_TOKEN,
+      import_core2.TOKEN_KEYS.REFRESH_TOKEN,
+      import_core2.TOKEN_KEYS.USER_JSON
+    );
   }
   async getSession() {
     const [accessToken, refreshToken, expiresAtStr, userJson] = await Promise.all([
@@ -1165,7 +1277,7 @@ var _OneloElectronAuth = class _OneloElectronAuth {
         throw import_core.OneloError.userRevoked();
       }
       if (reason === "no_plan_available") {
-        throw import_core.OneloError.planRequired();
+        throw import_core.OneloError.noActivePlan();
       }
       return null;
     }
@@ -1179,12 +1291,27 @@ var _OneloElectronAuth = class _OneloElectronAuth {
    * Handles the deep-link callback automatically — no app.on('open-url') needed.
    * Works on both free and paid plans. On free plan the hosted page includes Onelo branding.
    *
+   * A hard flow-resolve failure (attestation / codesign / bundle-id mismatch →
+   * 403, store misconfig, offline) is NOT thrown — it opens a graceful error
+   * window with "Try again" and resolves `null` if the user closes it (#31).
+   * The ONLY case that still throws is a REVOKED publishable key
+   * (`OneloError.invalidKey`) — a permanent developer misconfig where retry is
+   * meaningless — so wrap this call in try/catch (the auth-gate snippet does).
+   *
    * @param parentWindow  Optional parent BrowserWindow (for modal centering)
+   * @throws {OneloError} `invalid_publishable_key` if the app key is revoked.
    */
   async presentAuthWindow(parentWindow) {
     await this.waitReady();
     if (this.isRevoked) throw import_core.OneloError.invalidKey("Application key has been revoked");
-    const decision = await this.resolveFlow();
+    let decision;
+    try {
+      decision = await this.resolveFlow();
+    } catch (err) {
+      const reason = err instanceof import_core.OneloError ? err.message : String(err);
+      console.warn("[Onelo] Auth flow could not be resolved \u2014 showing retry UI: " + reason);
+      return this.presentFlowError(parentWindow);
+    }
     if (decision.action === "authorized") {
       if (this.paywallEnabled) await this.revalidateEntitlement().catch(() => {
       });
@@ -1217,11 +1344,15 @@ var _OneloElectronAuth = class _OneloElectronAuth {
           height: 720,
           minWidth: 440,
           minHeight: 680,
-          parent: parentWindow,
+          parent: parentWindow ?? void 0,
           modal: !!parentWindow,
           resizable: true,
           minimizable: false,
           maximizable: false,
+          // #26 — paint the branding page background (checkout_bg_color, default
+          // #111111) so the window doesn't flash white before the hosted page
+          // paints. Parity with the customer-portal window (customer-portal.ts).
+          backgroundColor: this.resolvedConfig?.pageBackgroundColor ?? "#111111",
           webPreferences: { nodeIntegration: false, contextIsolation: true },
           title: title ?? this.appName ?? "Sign in"
         });
@@ -1265,6 +1396,64 @@ var _OneloElectronAuth = class _OneloElectronAuth {
         win.webContents.on("will-navigate", handleNav);
         win.on("closed", () => {
           resolve(null);
+        });
+      }).catch(reject);
+    });
+  }
+  /**
+   * #31 — Present a graceful error window with a "Try again" button when the auth
+   * flow can't be resolved (attestation / codesign / bundle-id mismatch → 403,
+   * store misconfig, offline). Called by presentAuthWindow's catch so a hard
+   * reject shows UI instead of throwing without a window. Parity with Flutter
+   * `_errorScaffold` (#30) and RN's retry screen.
+   *
+   * Resolves with the eventual session if the user hits "Try again" and the retry
+   * succeeds, or `null` if they close the window (same "no session" contract as
+   * presentHostedUrl closing without a code).
+   */
+  presentFlowError(parentWindow) {
+    return new Promise((resolve, reject) => {
+      import("electron").then(({ BrowserWindow }) => {
+        const win = new BrowserWindow({
+          // Same enforced floor as the hosted auth window (presentHostedUrl) so the
+          // error/retry state doesn't render in an oddly-sized window.
+          width: 480,
+          height: 720,
+          minWidth: 440,
+          minHeight: 680,
+          parent: parentWindow ?? void 0,
+          modal: !!parentWindow,
+          resizable: true,
+          minimizable: false,
+          maximizable: false,
+          // Hard #111111 (NOT branding bg) — the error page is #111111 and the white
+          // "Try again" button must stay legible; matches Flutter's error scaffold.
+          backgroundColor: "#111111",
+          webPreferences: { nodeIntegration: false, contextIsolation: true },
+          title: this.appName ?? "Sign in"
+        });
+        win.setMenuBarVisibility(false);
+        win.loadURL("data:text/html;charset=utf-8," + encodeURIComponent(flowErrorHtml())).catch(() => {
+          if (!win.isDestroyed()) win.close();
+        });
+        let retrying = false;
+        const onRetry = (event, url) => {
+          if (!url.startsWith("onelo-retry://")) return;
+          event.preventDefault();
+          retrying = true;
+          win.webContents.removeListener("will-redirect", onRetry);
+          win.webContents.removeListener("will-navigate", onRetry);
+          win.close();
+          this.presentAuthWindow(parentWindow).then(resolve).catch(reject);
+        };
+        win.webContents.on("will-redirect", onRetry);
+        win.webContents.on("will-navigate", onRetry);
+        win.webContents.setWindowOpenHandler(({ url }) => {
+          import("electron").then(({ shell }) => shell.openExternal(url));
+          return { action: "deny" };
+        });
+        win.on("closed", () => {
+          if (!retrying) resolve(null);
         });
       }).catch(reject);
     });
@@ -1376,7 +1565,7 @@ var _OneloElectronAuth = class _OneloElectronAuth {
           height: 680,
           minWidth: 440,
           minHeight: 640,
-          parent: parentWindow,
+          parent: parentWindow ?? void 0,
           modal: !!parentWindow,
           resizable: true,
           minimizable: false,
@@ -1385,7 +1574,7 @@ var _OneloElectronAuth = class _OneloElectronAuth {
           webPreferences: {
             nodeIntegration: false,
             contextIsolation: true,
-            preload: import_path2.default.join(__dirname, "auth-view-preload.js")
+            preload: import_path3.default.join(__dirname, "auth-view-preload.js")
           }
         });
         win.setMenuBarVisibility(false);
@@ -2191,12 +2380,15 @@ function httpGet2(url, headers = {}) {
   });
 }
 var FEEDBACK_SUBMITTED_SENTINEL = "onelo://feedback_submitted";
+var FEEDBACK_CLOSE_SENTINEL = "onelo://feedback_close";
 var FEEDBACK_RETRY_SENTINEL = "onelo://feedback_retry";
 var POSTMESSAGE_RELAY_SCRIPT = `
 (function () {
   window.addEventListener('message', function (e) {
     if (e.data && e.data.type === 'onelo:feedback_submitted') {
       window.location.href = '${FEEDBACK_SUBMITTED_SENTINEL}';
+    } else if (e.data && e.data.type === 'onelo:feedback_close') {
+      window.location.href = '${FEEDBACK_CLOSE_SENTINEL}';
     }
   });
 })();
@@ -2295,7 +2487,7 @@ var OneloFeedback = class {
       this.window = null;
     });
     const handleNav = (event, url) => {
-      if (url.startsWith(FEEDBACK_SUBMITTED_SENTINEL)) {
+      if (url.startsWith(FEEDBACK_SUBMITTED_SENTINEL) || url.startsWith(FEEDBACK_CLOSE_SENTINEL)) {
         event.preventDefault();
         this.window?.close();
         this.window = null;
@@ -2359,7 +2551,7 @@ var OneloFeedback = class {
 };
 
 // src/monitor.ts
-var import_os = __toESM(require("os"));
+var import_os2 = __toESM(require("os"));
 
 // src/scrubber.ts
 var REDACTED = "[REDACTED]";
@@ -2447,7 +2639,7 @@ function _deviceContext() {
   const d = {};
   try {
     d["platform"] = process.platform;
-    d["osRelease"] = import_os.default.release();
+    d["osRelease"] = import_os2.default.release();
     d["arch"] = process.arch;
     d["nodeVersion"] = process.version;
   } catch {

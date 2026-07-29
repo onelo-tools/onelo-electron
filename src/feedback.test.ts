@@ -1,5 +1,10 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { OneloFeedback } from './feedback'
+import {
+  OneloFeedback,
+  POSTMESSAGE_RELAY_SCRIPT,
+  FEEDBACK_CLOSE_SENTINEL,
+  FEEDBACK_SUBMITTED_SENTINEL,
+} from './feedback'
 import { OneloFeatures } from './features'
 
 vi.mock('electron', () => ({
@@ -64,6 +69,21 @@ describe('OneloFeedback', () => {
   describe('track() shim', () => {
     it('does not throw', () => {
       expect(() => feedback.track('checkout')).not.toThrow()
+    })
+  })
+
+  describe('hosted close ✕ (onelo:feedback_close)', () => {
+    it('relay forwards the hosted feedback_close message to the close sentinel', () => {
+      // The hosted page (frontend HostedCloseX) postMessages onelo:feedback_close
+      // when its ✕ is tapped; the injected relay must convert it to the sentinel
+      // the will-navigate interceptor closes on — twin of feedback_submitted.
+      expect(POSTMESSAGE_RELAY_SCRIPT).toContain("e.data.type === 'onelo:feedback_close'")
+      expect(POSTMESSAGE_RELAY_SCRIPT).toContain(`window.location.href = '${FEEDBACK_CLOSE_SENTINEL}'`)
+    })
+
+    it('still relays the submitted message (unchanged twin)', () => {
+      expect(POSTMESSAGE_RELAY_SCRIPT).toContain("e.data.type === 'onelo:feedback_submitted'")
+      expect(POSTMESSAGE_RELAY_SCRIPT).toContain(`window.location.href = '${FEEDBACK_SUBMITTED_SENTINEL}'`)
     })
   })
 

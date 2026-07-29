@@ -86,5 +86,29 @@ export class SecureTokenStorage {
     const path = this.getStorePath()
     if (existsSync(path)) writeFileSync(path, '{}', 'utf-8')
   }
+
+  /**
+   * Synchronous presence check for one or more stored keys, WITHOUT decrypting.
+   * Reads the raw encrypted store straight off disk (`readFileSync`) and reports
+   * whether EVERY requested key is present. Backs the cold-start
+   * `hasStoredSession()` primitive (#36): a fast, init-independent "am I logged
+   * in?" hint. Deliberately checks key presence only (no `decryptString`) so it
+   * never depends on the OS keychain being unlockable and never throws.
+   * The on-disk file is the source of truth — `set`/`delete`/`clear` all persist
+   * synchronously, so this stays consistent with the async accessors.
+   * Returns false if the store file is missing, empty, or unreadable.
+   */
+  hasKeysSync(...keys: string[]): boolean {
+    if (keys.length === 0) return false
+    const path = this.getStorePath()
+    if (!existsSync(path)) return false
+    try {
+      const raw = JSON.parse(readFileSync(path, 'utf-8')) as Record<string, unknown>
+      return keys.every((k) => Object.prototype.hasOwnProperty.call(raw, k))
+    } catch {
+      // Corrupted / unreadable file — treat as "no stored session".
+      return false
+    }
+  }
 }
 

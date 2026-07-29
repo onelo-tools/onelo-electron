@@ -1,4 +1,4 @@
-import { getCachedCodesignFingerprint } from './codesign'
+import { getCachedCodesignFingerprint, getCodesignOS } from './codesign'
 import { getInstanceId } from './instance-id'
 import { version as SDK_VERSION } from '../package.json'
 
@@ -17,6 +17,7 @@ export function sdkHeaders(
   const bundleId = typeof bundleIdOrExtra === 'string' ? bundleIdOrExtra : undefined
   const extraHeaders = typeof bundleIdOrExtra === 'object' ? bundleIdOrExtra : extra
   const fp = getCachedCodesignFingerprint()
+  const codesignOS = fp ? getCodesignOS() : null
   return {
     'X-SDK-Version': SDK_VERSION,
     // Platform attribution for feature discovery. Without this, rows registered
@@ -39,6 +40,7 @@ export function sdkHeaders(
     'X-Onelo-Instance-Id': getInstanceId(),
     ...(bundleId ? { 'X-Bundle-Id': bundleId } : {}),
     ...(fp ? { 'X-Codesign-Fingerprint': fp } : {}),
+    ...(codesignOS ? { 'X-Codesign-Platform': codesignOS } : {}),
     ...extraHeaders,
   }
 }

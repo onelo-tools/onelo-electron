@@ -185,6 +185,9 @@ declare class OneloElectronAuth {
     isReady: boolean;
     /** True if the publishable key has been revoked */
     isRevoked: boolean;
+    /** #29 — non-null when `initialize()` threw; previously swallowed silently
+     *  (isReady=false forever with no trace). Surfaced + logged for diagnosis. */
+    initError: string | null;
     /** Whether the tenant's plan allows custom auth UI */
     allowCustomBranding: boolean;
     /** App name from dashboard — shown in hosted sign-in UI */
@@ -216,6 +219,23 @@ declare class OneloElectronAuth {
     signIn(email: string, password: string): Promise<OneloSession>;
     signUp(email: string, password: string): Promise<OneloSession>;
     signOut(): Promise<void>;
+    /**
+     * Instant, SYNCHRONOUS presence check for a locally stored session. Unlike
+     * `getSession()` it does NOT await init (`whenReady()`) — no `/api/sdk/config`
+     * round-trip — and never touches the network. It is a pure secure-store
+     * presence read (access + refresh + user tokens all present), so the host app
+     * / window logic can decide AT COLD START, before init resolves, whether a
+     * launch is an auto-login (keep the hidden main window hidden while restore
+     * runs, or paint the branded auth window) or a genuine signed-out start.
+     * Parity with Android `hasStoredSession()` and Swift `hasStoredSessionSync()`
+     * (#36).
+     *
+     * This is an optimistic hint, NOT validation: it does not check token expiry or
+     * server-side revocation. Always drive real access off `getSession()` (expiry →
+     * refresh) — that enforcement path is unchanged. Mirrors the same three-token
+     * completeness check `getSession()` requires before returning a session.
+     */
+    hasStoredSession(): boolean;
     getSession(): Promise<OneloSession | null>;
     /**
      * True when the current session's user has an active paid entitlement.
@@ -261,9 +281,17 @@ declare class OneloElectronAuth {
      * Handles the deep-link callback automatically — no app.on('open-url') needed.
      * Works on both free and paid plans. On free plan the hosted page includes Onelo branding.
      *
+     * A hard flow-resolve failure (attestation / codesign / bundle-id mismatch →
+     * 403, store misconfig, offline) is NOT thrown — it opens a graceful error
+     * window with "Try again" and resolves `null` if the user closes it (#31).
+     * The ONLY case that still throws is a REVOKED publishable key
+     * (`OneloError.invalidKey`) — a permanent developer misconfig where retry is
+     * meaningless — so wrap this call in try/catch (the auth-gate snippet does).
+     *
      * @param parentWindow  Optional parent BrowserWindow (for modal centering)
+     * @throws {OneloError} `invalid_publishable_key` if the app key is revoked.
      */
-    presentAuthWindow(parentWindow?: electron.BrowserWindow): Promise<OneloSession | null>;
+    presentAuthWindow(parentWindow?: electron.BrowserWindow | null): Promise<OneloSession | null>;
     /**
      * Present any Onelo-hosted flow URL (sign-in, store, …) in an in-app
      * BrowserWindow and complete it: a `<protocol>://…?code=` deep-link is
@@ -274,7 +302,19 @@ declare class OneloElectronAuth {
      * browser — the session then arrives via app.on('open-url') → handleDeepLink).
      * Shared by presentAuthWindow and the store flow (OneloStore).
      */
-    presentHostedUrl(hostedUrl: string, parentWindow?: electron.BrowserWindow, title?: string): Promise<OneloSession | null>;
+    presentHostedUrl(hostedUrl: string, parentWindow?: electron.BrowserWindow | null, title?: string): Promise<OneloSession | null>;
+    /**
+     * #31 — Present a graceful error window with a "Try again" button when the auth
+     * flow can't be resolved (attestation / codesign / bundle-id mismatch → 403,
+     * store misconfig, offline). Called by presentAuthWindow's catch so a hard
+     * reject shows UI instead of throwing without a window. Parity with Flutter
+     * `_errorScaffold` (#30) and RN's retry screen.
+     *
+     * Resolves with the eventual session if the user hits "Try again" and the retry
+     * succeeds, or `null` if they close the window (same "no session" contract as
+     * presentHostedUrl closing without a code).
+     */
+    private presentFlowError;
     /**
      * Open the Onelo hosted sign-in page in the system default browser.
      * You must call handleDeepLink() from app.on('open-url') to complete the flow.
@@ -309,7 +349,7 @@ declare class OneloElectronAuth {
      * @param parentWindow  Optional parent BrowserWindow (centers/modals the auth window).
      * @returns             Resolves with a session after successful sign-in or sign-up.
      */
-    loadAuthView(parentWindow?: electron.BrowserWindow): Promise<OneloSession | null>;
+    loadAuthView(parentWindow?: electron.BrowserWindow | null): Promise<OneloSession | null>;
     sendMagicLink(email: string, redirectTo?: string): Promise<void>;
     sendPasswordReset(email: string, redirectTo?: string): Promise<void>;
     private saveSession;
@@ -1055,6 +1095,18 @@ declare class SecureTokenStorage {
     get(key: string): Promise<string | null>;
     delete(key: string): Promise<void>;
     clear(): Promise<void>;
+    /**
+     * Synchronous presence check for one or more stored keys, WITHOUT decrypting.
+     * Reads the raw encrypted store straight off disk (`readFileSync`) and reports
+     * whether EVERY requested key is present. Backs the cold-start
+     * `hasStoredSession()` primitive (#36): a fast, init-independent "am I logged
+     * in?" hint. Deliberately checks key presence only (no `decryptString`) so it
+     * never depends on the OS keychain being unlockable and never throws.
+     * The on-disk file is the source of truth — `set`/`delete`/`clear` all persist
+     * synchronously, so this stays consistent with the async accessors.
+     * Returns false if the store file is missing, empty, or unreadable.
+     */
+    hasKeysSync(...keys: string[]): boolean;
 }
 
 export { type FeatureReason, type FeatureSnapshot, FeatureState, type FeatureStatus, IPC_CHANNELS, type MonitorContext, type MonitorEventOptions, Onelo, OneloConsent, type OneloConsentEnforcement, type OneloConsentRequirement, OneloElectronAuth, type OneloElectronConfig, OneloElectronCustomerPortal, OneloFeatures, OneloFeaturesError, type OneloFeaturesErrorCode, OneloFeedback, OneloForms, OneloMonitor, OneloStore, OneloWaitlist, SecureTokenStorage, type UpgradeHint };

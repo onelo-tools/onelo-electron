@@ -44,17 +44,24 @@ function httpGet(url: string, headers: Record<string, string> = {}): Promise<{ s
   })
 }
 
-const FEEDBACK_SUBMITTED_SENTINEL = 'onelo://feedback_submitted'
+export const FEEDBACK_SUBMITTED_SENTINEL = 'onelo://feedback_submitted'
+// The hosted page renders the close "✕" now (frontend HostedCloseX) and emits
+// `onelo:feedback_close` when tapped — twin of `onelo:feedback_submitted`. Its
+// sentinel is intercepted by the same will-navigate handler → close the window
+// (parity with the hosted-rendered ✕ on every SDK; spec 2026-07-27).
+export const FEEDBACK_CLOSE_SENTINEL = 'onelo://feedback_close'
 // The error screen's "Try again" button navigates here; the persistent
 // will-navigate interceptor catches it and re-runs the fetch in the same window
 // (parity with Swift's onelo://feedback_retry sentinel + FeedbackWebCoordinator).
 const FEEDBACK_RETRY_SENTINEL = 'onelo://feedback_retry'
 
-const POSTMESSAGE_RELAY_SCRIPT = `
+export const POSTMESSAGE_RELAY_SCRIPT = `
 (function () {
   window.addEventListener('message', function (e) {
     if (e.data && e.data.type === 'onelo:feedback_submitted') {
       window.location.href = '${FEEDBACK_SUBMITTED_SENTINEL}';
+    } else if (e.data && e.data.type === 'onelo:feedback_close') {
+      window.location.href = '${FEEDBACK_CLOSE_SENTINEL}';
     }
   });
 })();
@@ -173,9 +180,10 @@ export class OneloFeedback {
     // will-navigate, so only the page's own `window.location='onelo://…'` reaches
     // here:
     //   • feedback_submitted → close the window (the form posted successfully)
+    //   • feedback_close     → close the window (hosted-rendered ✕ was tapped)
     //   • feedback_retry     → re-run the fetch in the SAME window (Swift onRetry)
     const handleNav = (event: Electron.Event, url: string) => {
-      if (url.startsWith(FEEDBACK_SUBMITTED_SENTINEL)) {
+      if (url.startsWith(FEEDBACK_SUBMITTED_SENTINEL) || url.startsWith(FEEDBACK_CLOSE_SENTINEL)) {
         event.preventDefault()
         this.window?.close()
         this.window = null

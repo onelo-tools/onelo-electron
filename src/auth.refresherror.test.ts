@@ -58,10 +58,13 @@ describe('refreshSession error mapping (H3)', () => {
     expect(auth.isUserRevoked).toBe(true)
   })
 
-  it('no_plan_available (error_code) → throws (planRequired), NOT a revocation', async () => {
+  it('no_plan_available (error_code) → throws noActivePlan, NOT a revocation', async () => {
     const auth = makeAuth()
     httpPost.mockResolvedValue({ status: 403, json: { detail: { error_code: 'no_plan_available' } } })
-    await expect(auth.refreshSession()).rejects.toThrow()
+    // Lapsed subscription = `no_active_plan` (route to store/upgrade), not
+    // `plan_required` (custom-UI/loadAuthView) and not a revocation.
+    const err = await auth.refreshSession().catch((e) => e)
+    expect(err?.code).toBe('no_active_plan')
     expect(storage.clear).toHaveBeenCalled()
     expect(auth.isUserRevoked).toBe(false)
   })
