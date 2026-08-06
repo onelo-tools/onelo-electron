@@ -648,6 +648,10 @@ declare class OneloMonitor {
     private readonly breadcrumbs;
     private flushTimer;
     private currentUserId;
+    /** Serialises all drains so a timer flush and an error flush can't overlap. */
+    private flushChain;
+    /** Epoch ms until which we hold off sending (set from a 429 `Retry-After`). */
+    private retryAfterUntil;
     /** Deployment tag ("production"|"staging"|"dev"|custom) → meta.environment.
      *  Per-event meta.environment overrides. Distinct from featureEnvironment. */
     private readonly environment?;
@@ -697,8 +701,37 @@ declare class OneloMonitor {
      * delivered. Pass `timeoutMs` to bound the wait — for a short-lived process
      * exiting against a possibly-hung API, so shutdown can't block forever (parity
      * with Swift `flush(timeout:)` / Python `flush(timeout=)`). Never throws.
+     *
+     * Drains are SERIALISED through one promise chain: the 15s timer, an error
+     * auto-flush and the quit flush must never drain concurrently, because two
+     * overlapping drains would interleave batches (and the second would see an
+     * empty buffer and report "sent").
      */
     flush(timeoutMs?: number): Promise<void>;
+    private _drain;
+    /**
+     * One POST. Never throws — classifies the result instead. When `timeoutMs` is
+     * set the attempt is bounded two ways: we abort the request AND race it
+     * against a timer. The race is what actually guarantees the bound — an
+     * `AbortController` only helps if the fetch implementation honours the signal,
+     * and if it doesn't, `await fetch(...)` would hang and block the quit forever.
+     * The abort is still issued so the aborted request can't dangle and hold the
+     * event loop open past exit.
+     */
+    private _sendOnce;
+    /** Map an HTTP response to a delivery outcome. */
+    private _classify;
+    /**
+     * Put an undelivered batch back at the FRONT of the buffer so the next flush
+     * retries it, then re-apply the cap.
+     *
+     * Priority policy under a sustained outage: NEWEST EVENTS WIN. The buffer is
+     * trimmed from the front, so the oldest re-queued events go first. This matches
+     * `_push`'s newest-wins eviction, keeps memory bounded at MAX_BUFFER_SIZE no
+     * matter how long the backend is down, and stops a wedged batch from starving
+     * live telemetry. Drops are reported, never silent.
+     */
+    private _requeue;
     destroy(): Promise<void>;
     /** Fold stack/errorType into a caller's meta without mutating it. */
     private _withError;

@@ -12,6 +12,9 @@ describe('OneloMonitor', () => {
 
   beforeEach(() => {
     monitor = new OneloMonitor(MOCK_KEY, MOCK_API)
+    // Constructor auto-emits an unconditional `session_opened` event — reset the
+    // buffer so per-test event counts/assertions stay exact.
+    ;(monitor as unknown as { buffer: unknown[] }).buffer.length = 0
     fetchSpy = vi.spyOn(global, 'fetch').mockResolvedValue({
       ok: true,
       status: 204,
@@ -67,6 +70,7 @@ describe('OneloMonitor.track()', () => {
 
   beforeEach(() => {
     monitor = new OneloMonitor(MOCK_KEY, MOCK_API)
+    ;(monitor as unknown as { buffer: unknown[] }).buffer.length = 0
     fetchSpy = vi.spyOn(global, 'fetch').mockResolvedValue({ ok: true, status: 204 } as Response)
   })
   afterEach(() => { vi.restoreAllMocks(); monitor.destroy() })
@@ -135,6 +139,7 @@ describe('OneloMonitor session', () => {
 
   beforeEach(() => {
     monitor = new OneloMonitor(MOCK_KEY, MOCK_API)
+    ;(monitor as unknown as { buffer: unknown[] }).buffer.length = 0
     fetchSpy = vi.spyOn(global, 'fetch').mockResolvedValue({ ok: true, status: 204 } as Response)
   })
   afterEach(() => { vi.restoreAllMocks(); monitor.destroy() })

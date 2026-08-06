@@ -12,6 +12,7 @@ describe('OneloMonitor context (environment + app version)', () => {
 
   it('attaches meta.environment from the config default', async () => {
     const m = new OneloMonitor(KEY, API, { environment: 'staging' })
+    ;(m as unknown as { buffer: unknown[] }).buffer.length = 0
     m.event('checkout', { ok: true })
     await m.flush()
     const body = JSON.parse((fetchSpy.mock.calls[0][1] as RequestInit).body as string)
@@ -21,6 +22,7 @@ describe('OneloMonitor context (environment + app version)', () => {
 
   it('a per-event meta.environment overrides the config default', async () => {
     const m = new OneloMonitor(KEY, API, { environment: 'staging' })
+    ;(m as unknown as { buffer: unknown[] }).buffer.length = 0
     m.event('checkout', { ok: true, meta: { environment: 'prod' } })
     await m.flush()
     const body = JSON.parse((fetchSpy.mock.calls[0][1] as RequestInit).body as string)
@@ -30,6 +32,7 @@ describe('OneloMonitor context (environment + app version)', () => {
 
   it('attaches meta.app.version + build + bundleId', async () => {
     const m = new OneloMonitor(KEY, API, { bundleId: 'com.acme', appVersion: '1.4.2', appBuild: '77' })
+    ;(m as unknown as { buffer: unknown[] }).buffer.length = 0
     m.event('checkout', { ok: true })
     await m.flush()
     const body = JSON.parse((fetchSpy.mock.calls[0][1] as RequestInit).body as string)
@@ -39,6 +42,7 @@ describe('OneloMonitor context (environment + app version)', () => {
 
   it('omits meta.environment + meta.app when no context given', async () => {
     const m = new OneloMonitor(KEY, API)
+    ;(m as unknown as { buffer: unknown[] }).buffer.length = 0
     m.event('checkout', { ok: true })
     await m.flush()
     const body = JSON.parse((fetchSpy.mock.calls[0][1] as RequestInit).body as string)

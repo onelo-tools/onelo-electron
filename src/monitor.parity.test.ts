@@ -16,6 +16,9 @@ describe('OneloMonitor — parity (flags / breadcrumbs / scrub / capture / devic
   let fetchSpy: any
   beforeEach(() => {
     m = new OneloMonitor(KEY, API, { bundleId: 'com.acme.app' })
+    // Constructor auto-emits an unconditional `session_opened` event — reset the
+    // buffer so per-test event assertions (events[0]) stay exact.
+    ;(m as unknown as { buffer: unknown[] }).buffer.length = 0
     fetchSpy = vi.spyOn(global, 'fetch').mockResolvedValue({ ok: true, status: 204 } as Response)
   })
   afterEach(() => { vi.restoreAllMocks(); void m.destroy() })
@@ -80,6 +83,10 @@ describe('OneloMonitor — dual-instance (latest-wins global routing)', () => {
   it('routes an uncaught crash to the MOST RECENT live monitor', async () => {
     const a = new OneloMonitor(KEY, API)
     const b = new OneloMonitor(KEY, API) // becomes active
+    // Constructor auto-emits an unconditional `session_opened` event — reset both
+    // buffers so the crash event lands as events[0].
+    ;(a as unknown as { buffer: unknown[] }).buffer.length = 0
+    ;(b as unknown as { buffer: unknown[] }).buffer.length = 0
     const fetchSpy = vi.spyOn(global, 'fetch').mockResolvedValue({ ok: true, status: 204 } as Response)
     try {
       ;(process as NodeJS.EventEmitter).emit('uncaughtExceptionMonitor', new Error('crash'))
