@@ -38,6 +38,18 @@ export function sdkHeaders(
     // Per-install id — required by the backend for test-env feature discovery
     // (TOFU binding) and sent on every request (parity with Swift).
     'X-Onelo-Instance-Id': getInstanceId(),
+    // WHICH OS, as distinct from 'X-Onelo-Sdk-Platform' above (which SDK).
+    // Only 'macos' matters to the backend: it is the one Electron target that
+    // can ship through an Apple store, so it is the one where the
+    // "Require plan on sign-up" gate may need suppressing
+    // (applications.paywall_gate_on_apple). Windows and Linux are unaffected —
+    // and a Mac app shipped as a DMG is too, which is why the developer's
+    // dashboard setting decides, not this header alone.
+    'X-Onelo-OS':
+      process.platform === 'darwin' ? 'macos'
+      : process.platform === 'win32' ? 'windows'
+      : process.platform === 'linux' ? 'linux'
+      : 'unknown',
     ...(bundleId ? { 'X-Bundle-Id': bundleId } : {}),
     ...(fp ? { 'X-Codesign-Fingerprint': fp } : {}),
     ...(codesignOS ? { 'X-Codesign-Platform': codesignOS } : {}),
