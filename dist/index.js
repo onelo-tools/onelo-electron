@@ -39,6 +39,7 @@ var require_types = __commonJS({
     "use strict";
     Object.defineProperty(exports2, "__esModule", { value: true });
     exports2.OneloError = void 0;
+    exports2.extractErrorCode = extractErrorCode2;
     var OneloError2 = class _OneloError extends Error {
       constructor(code, message) {
         super(message);
@@ -91,6 +92,22 @@ var require_types = __commonJS({
       }
     };
     exports2.OneloError = OneloError2;
+    function extractErrorCode2(json) {
+      if (!json || typeof json !== "object")
+        return void 0;
+      const body = json;
+      if (typeof body.error === "string" && body.error)
+        return body.error;
+      const detail = body.detail;
+      if (typeof detail === "string" && detail)
+        return detail;
+      if (detail && typeof detail === "object") {
+        const nested = detail.error;
+        if (typeof nested === "string" && nested)
+          return nested;
+      }
+      return void 0;
+    }
   }
 });
 
@@ -199,7 +216,11 @@ var require_session = __commonJS({
           tenantId: appMeta["tenant_id"] ?? user["tenant_id"] ?? null,
           // Backend sends "active" | "none"; absent MUST decode to 'none' (never
           // treat a missing entitlement as active). Round-trips via USER_JSON.
-          entitlement: user["entitlement"] === "active" ? "active" : "none"
+          entitlement: user["entitlement"] === "active" ? "active" : "none",
+          // Undefined (not false) when the backend did not send it: "the server did
+          // not say" and "the server said no" are different, and only the first may
+          // fall back to the old client-side derivation.
+          allowedIn: typeof user["allowed_in"] === "boolean" ? user["allowed_in"] : void 0
         }
       };
     }
@@ -207,7 +228,22 @@ var require_session = __commonJS({
       ACCESS_TOKEN: "onelo_access_token",
       REFRESH_TOKEN: "onelo_refresh_token",
       EXPIRES_AT: "onelo_expires_at",
-      USER_JSON: "onelo_user"
+      USER_JSON: "onelo_user",
+      /**
+       * PKCE verifier for an OUTSTANDING magic link.
+       *
+       * Every other verifier this SDK uses lives in memory, which is correct for
+       * flows that finish in the same page. A magic link does not: the email opens
+       * a NEW tab (often after a relaunch), so an in-memory verifier is gone by the
+       * time the code comes back and /hosted-callback would 401 on a link that is
+       * already spent — locking the user out with no recovery. That is exactly why
+       * magic links shipped WITHOUT a challenge.
+       *
+       * Persisting it is what makes the binding possible on the web: the new tab is
+       * the same origin, so it can read this back. Deleted the moment the exchange
+       * finishes or fails, and cleared with the rest on sign-out.
+       */
+      MAGIC_LINK_VERIFIER: "onelo_magic_link_verifier"
     };
   }
 });
@@ -355,9 +391,9 @@ function getInstanceId() {
   try {
     const { app } = require("electron");
     const fs = require("fs");
-    const path2 = require("path");
-    const dir = path2.join(app.getPath("userData"), "onelo");
-    const file = path2.join(dir, "instance-id");
+    const path = require("path");
+    const dir = path.join(app.getPath("userData"), "onelo");
+    const file = path.join(dir, "instance-id");
     let id = null;
     try {
       id = fs.readFileSync(file, "utf8").trim() || null;
@@ -390,7 +426,7 @@ var init_instance_id = __esm({
 var version;
 var init_package = __esm({
   "package.json"() {
-    version = "0.40.0";
+    version = "0.46.1";
   }
 });
 
@@ -471,7 +507,6 @@ __export(index_exports, {
 module.exports = __toCommonJS(index_exports);
 
 // src/auth.ts
-var import_path3 = __toESM(require("path"));
 var import_core2 = __toESM(require_dist());
 
 // src/storage.ts
@@ -495,10 +530,10 @@ var SecureTokenStorage = class {
     return this.storePath;
   }
   loadFromDisk() {
-    const path2 = this.getStorePath();
-    if (!(0, import_fs.existsSync)(path2)) return;
+    const path = this.getStorePath();
+    if (!(0, import_fs.existsSync)(path)) return;
     try {
-      const raw = JSON.parse((0, import_fs.readFileSync)(path2, "utf-8"));
+      const raw = JSON.parse((0, import_fs.readFileSync)(path, "utf-8"));
       const { safeStorage } = require("electron");
       for (const [key, bufArr] of Object.entries(raw)) {
         try {
@@ -512,14 +547,14 @@ var SecureTokenStorage = class {
     }
   }
   saveToDisk() {
-    const path2 = this.getStorePath();
+    const path = this.getStorePath();
     const { safeStorage } = require("electron");
     const out = {};
     for (const [key, value] of this.cache.entries()) {
       const encrypted = safeStorage.encryptString(value);
       out[key] = Array.from(encrypted);
     }
-    (0, import_fs.writeFileSync)(path2, JSON.stringify(out), "utf-8");
+    (0, import_fs.writeFileSync)(path, JSON.stringify(out), "utf-8");
   }
   async set(key, value) {
     const { safeStorage } = await import("electron");
@@ -540,8 +575,8 @@ var SecureTokenStorage = class {
   }
   async clear() {
     this.cache.clear();
-    const path2 = this.getStorePath();
-    if ((0, import_fs.existsSync)(path2)) (0, import_fs.writeFileSync)(path2, "{}", "utf-8");
+    const path = this.getStorePath();
+    if ((0, import_fs.existsSync)(path)) (0, import_fs.writeFileSync)(path, "{}", "utf-8");
   }
   /**
    * Synchronous presence check for one or more stored keys, WITHOUT decrypting.
@@ -556,10 +591,10 @@ var SecureTokenStorage = class {
    */
   hasKeysSync(...keys) {
     if (keys.length === 0) return false;
-    const path2 = this.getStorePath();
-    if (!(0, import_fs.existsSync)(path2)) return false;
+    const path = this.getStorePath();
+    if (!(0, import_fs.existsSync)(path)) return false;
     try {
-      const raw = JSON.parse((0, import_fs.readFileSync)(path2, "utf-8"));
+      const raw = JSON.parse((0, import_fs.readFileSync)(path, "utf-8"));
       return keys.every((k) => Object.prototype.hasOwnProperty.call(raw, k));
     } catch {
       return false;
@@ -576,287 +611,6 @@ var IPC_CHANNELS = {
   REFRESH_SESSION: "onelo:refresh-session",
   OPEN_AUTH_URL: "onelo:open-auth-url"
 };
-
-// src/auth-view-html.ts
-function generateAuthViewHtml() {
-  return `<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Sign in</title>
-<style>
-  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-
-  body {
-    background: #0f0f0f;
-    color: #e8e8e8;
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-    font-size: 14px;
-    min-height: 100vh;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    padding: 24px;
-    -webkit-font-smoothing: antialiased;
-  }
-
-  .card {
-    width: 100%;
-    max-width: 360px;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 24px;
-  }
-
-  .logo-area {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 12px;
-  }
-
-  .app-logo {
-    width: 56px;
-    height: 56px;
-    border-radius: 12px;
-    object-fit: cover;
-  }
-
-  .app-name {
-    font-size: 20px;
-    font-weight: 600;
-    color: #ffffff;
-    text-align: center;
-  }
-
-  form {
-    width: 100%;
-    display: flex;
-    flex-direction: column;
-    gap: 12px;
-  }
-
-  label {
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-    font-size: 13px;
-    color: #a0a0a0;
-    font-weight: 500;
-  }
-
-  input {
-    background: #1a1a1a;
-    border: 1px solid #2e2e2e;
-    border-radius: 8px;
-    color: #e8e8e8;
-    font-size: 14px;
-    padding: 10px 12px;
-    outline: none;
-    transition: border-color 0.15s;
-    width: 100%;
-  }
-
-  input:focus {
-    border-color: #555;
-  }
-
-  input::placeholder {
-    color: #444;
-  }
-
-  button[type="submit"] {
-    background: #ffffff;
-    color: #0f0f0f;
-    border: none;
-    border-radius: 8px;
-    font-size: 14px;
-    font-weight: 600;
-    padding: 11px;
-    cursor: pointer;
-    margin-top: 4px;
-    transition: opacity 0.15s;
-    width: 100%;
-  }
-
-  button[type="submit"]:disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
-  }
-
-  .error {
-    color: #f87171;
-    font-size: 13px;
-    text-align: center;
-    min-height: 18px;
-  }
-
-  .toggle {
-    font-size: 13px;
-    color: #a0a0a0;
-    text-align: center;
-  }
-
-  .toggle a {
-    color: #e8e8e8;
-    text-decoration: underline;
-    cursor: pointer;
-  }
-
-  .footer {
-    position: fixed;
-    bottom: 14px;
-    left: 0;
-    right: 0;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: 5px;
-    font-size: 12px;
-    color: rgba(255,255,255,0.55);
-    user-select: none;
-    text-decoration: none;
-  }
-</style>
-</head>
-<body>
-<div class="card" id="card"></div>
-<a class="footer" href="https://onelo.tools" target="_blank">
-  <svg width="12" height="12" viewBox="0 0 100 100" fill="none"><circle cx="50" cy="50" r="39.5" fill="none" stroke="rgba(255,255,255,0.7)" stroke-width="17.1"/><circle cx="76.6" cy="23" r="14" fill="#FFA100"/></svg>
-  Powered by <strong style="color:rgba(255,255,255,0.85);font-weight:600;">Onelo</strong>
-</a>
-
-<script>
-(function () {
-  var mode = 'signin'; // 'signin' | 'signup'
-
-  function render(config) {
-    var card = document.getElementById('card');
-
-    var logoHtml = '';
-    if (config.appLogoUrl) {
-      logoHtml = '<img class="app-logo" src="' + escHtml(config.appLogoUrl) + '" alt="' + escHtml(config.appName) + '">';
-    }
-
-    var heading = mode === 'signin'
-      ? 'Sign in to ' + escHtml(config.appName)
-      : 'Create account';
-
-    var submitLabel = mode === 'signin' ? 'Sign In' : 'Create Account';
-
-    var confirmField = mode === 'signup'
-      ? '<label>Confirm Password<input type="password" id="confirm" placeholder="Confirm password" autocomplete="new-password"></label>'
-      : '';
-
-    var toggleText = mode === 'signin'
-      ? 'Don't have an account? <a id="toggle-link">Sign up</a>'
-      : 'Already have an account? <a id="toggle-link">Sign in</a>';
-
-    card.innerHTML =
-      '<div class="logo-area">' +
-        logoHtml +
-        '<div class="app-name">' + heading + '</div>' +
-      '</div>' +
-      '<form id="auth-form">' +
-        '<label>Email<input type="email" id="email" placeholder="you@example.com" autocomplete="email" required></label>' +
-        '<label>Password<input type="password" id="password" placeholder="Password" autocomplete="' + (mode === 'signin' ? 'current-password' : 'new-password') + '" required></label>' +
-        confirmField +
-        '<div class="error" id="error-msg"></div>' +
-        '<button type="submit" id="submit-btn">' + submitLabel + '</button>' +
-      '</form>' +
-      '<div class="toggle">' + toggleText + '</div>';
-
-    document.getElementById('auth-form').addEventListener('submit', function (e) {
-      e.preventDefault();
-      handleSubmit(config);
-    });
-
-    var toggleLink = document.getElementById('toggle-link');
-    if (toggleLink) {
-      toggleLink.addEventListener('click', function () {
-        mode = mode === 'signin' ? 'signup' : 'signin';
-        render(config);
-      });
-    }
-  }
-
-  function escHtml(str) {
-    return String(str)
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;');
-  }
-
-  function showError(msg) {
-    var el = document.getElementById('error-msg');
-    if (el) el.textContent = msg;
-  }
-
-  function clearError() {
-    var el = document.getElementById('error-msg');
-    if (el) el.textContent = '';
-  }
-
-  function setLoading(loading) {
-    var btn = document.getElementById('submit-btn');
-    if (!btn) return;
-    btn.disabled = loading;
-    btn.textContent = loading
-      ? 'Loading\u2026'
-      : (mode === 'signin' ? 'Sign In' : 'Create Account');
-  }
-
-  async function handleSubmit(config) {
-    clearError();
-    var email = document.getElementById('email').value.trim();
-    var password = document.getElementById('password').value;
-
-    if (!email || !password) {
-      showError('Please fill in all fields.');
-      return;
-    }
-
-    if (mode === 'signup') {
-      var confirm = document.getElementById('confirm').value;
-      if (password !== confirm) {
-        showError('Passwords do not match.');
-        return;
-      }
-    }
-
-    setLoading(true);
-    try {
-      var res = mode === 'signin'
-        ? await window.__oneloAuth.signIn(email, password)
-        : await window.__oneloAuth.signUp(email, password);
-
-      if (res.success) {
-        // Main process closes window and resolves the promise
-      } else {
-        showError(res.error || 'Authentication failed.');
-        setLoading(false);
-      }
-    } catch (err) {
-      showError('Unexpected error. Please try again.');
-      setLoading(false);
-    }
-  }
-
-  async function init() {
-    var config = await window.__oneloAuth.getConfig();
-    render(config);
-  }
-
-  init();
-})();
-</script>
-</body>
-</html>`;
-}
 
 // src/auth.ts
 init_sdk_headers();
@@ -911,6 +665,21 @@ async function resolveConfig(publishableKey, apiUrl, codeChallenge, clientSecret
     pageBackgroundColor: j["checkout_bg_color"] || "#111111"
   };
 }
+function hostedWindowSize(url) {
+  let path = "";
+  try {
+    path = new URL(url).pathname.toLowerCase();
+  } catch {
+    return { width: 480, minWidth: 440 };
+  }
+  const isWideSurface = path.startsWith("/store/") || path.startsWith("/customer/portal");
+  return isWideSurface ? { width: 780, minWidth: 560 } : { width: 480, minWidth: 440 };
+}
+function isExpiredAuthError(err) {
+  return err === "invalid_token" || err === "expired_token" || err === "token_expired";
+}
+var HOSTED_ORIGIN_KEY = "onelo_hosted_origin";
+var OAUTH_RETURN_TIMEOUT_MS = 5 * 60 * 1e3;
 var _OneloElectronAuth = class _OneloElectronAuth {
   constructor(config) {
     this.pkceVerifier = null;
@@ -944,6 +713,30 @@ var _OneloElectronAuth = class _OneloElectronAuth {
     /** Plan-gated enabled OAuth providers (google/github/apple) from
      *  /api/sdk/config. Empty when social is disabled. Parity with Swift. */
     this.oauthProviders = [];
+    /**
+     * Which hosted surface `presentAuthWindow()` last opened: `sign_in`, `store`,
+     * `no_plan`, or null when nothing was presented (the caller was already
+     * `authorized`, or the flow never got that far).
+     *
+     * `/api/sdk/flow/init`'s `surface` was read and immediately discarded, so a
+     * host app that got `null` back from `presentAuthWindow()` could not tell
+     * "user cancelled sign-in" from "user has no plan and closed the no_plan
+     * screen" — both close the SAME window the SAME way (`win.on('closed')` →
+     * `resolve(null)`). The return type stays `OneloElectronSession | null` —
+     * this is additive, reading it is optional. Parity with JS's
+     * `lastPresentedSurface`.
+     */
+    this.lastPresentedSurface = null;
+    /** A `loadAuthView()`/`presentAuthWindow()` call whose flow LEFT this app for
+     *  the system browser and has not come back yet. See `parkPendingFlow`.
+     *  `win` is the still-open hosted window it started in — a magic link (like
+     *  OAuth) is finished by a deep-link that lands OUTSIDE that window (email
+     *  client → system browser → this app's protocol handler), so nothing
+     *  in-window ever navigates it away. Tracking it here lets settlePendingFlow
+     *  close it once the flow is actually decided, instead of leaving it open as
+     *  an orphaned second "Check your inbox" window while a NEW window (the
+     *  deep-link's own outcome — success or the no-plan gate) opens next to it. */
+    this.pendingFlow = null;
     this.storage = new SecureTokenStorage();
     this.protocol = config.protocol ?? "onelo";
     this.apiUrl = config.apiUrl;
@@ -1104,6 +897,7 @@ var _OneloElectronAuth = class _OneloElectronAuth {
     return session;
   }
   async signOut() {
+    this.settlePendingFlow(null);
     this.signOutEpoch++;
     this.stopHeartbeat();
     this.clearRefreshTimer();
@@ -1180,6 +974,81 @@ var _OneloElectronAuth = class _OneloElectronAuth {
     return session?.user.entitlement === "active";
   }
   /**
+   * Hold the flow open across a hand-off to the system browser — an OAuth
+   * provider page, or a magic link opened from the user's email client. Both
+   * leave this app's hosted window open (or, for OAuth, about to close) with no
+   * in-window navigation to react to; the eventual outcome arrives later via
+   * `handleDeepLink`, disconnected from whatever `presentHostedUrl` call is
+   * still waiting.
+   *
+   * It used to resolve `null` at hand-off time, which is the same value the SDK
+   * uses for "the user cancelled". A host app therefore could not tell "nothing
+   * happened" from "a session is on its way", and the obvious
+   * `await loadAuthView(); mainWindow.show()` revealed the app as "Not signed
+   * in" while the account chooser was still open in Safari (Adrian, 2026-08-19).
+   *
+   * Now the promise stays pending until `handleDeepLink` settles it, matching
+   * Swift (ASWebAuthenticationSession stays alive) and React Native (the modal
+   * stays open). `null` goes back to meaning only "no session came of it".
+   */
+  parkPendingFlow(resolve, win = null) {
+    this.settlePendingFlow(null);
+    const timer = setTimeout(() => this.settlePendingFlow(null), OAUTH_RETURN_TIMEOUT_MS);
+    if (typeof timer.unref === "function") {
+      timer.unref();
+    }
+    this.pendingFlow = { resolve, timer, win };
+  }
+  /** Drop this window's parked entry WITHOUT resolving it — for when the
+   *  window is settling itself in-place (e.g. an in-window deep-link code, or
+   *  the expired-token reload) and would otherwise leave a stale parked entry
+   *  pointing at a window that's already closing. */
+  clearOwnParkedFlow(resolve) {
+    if (this.pendingFlow?.resolve !== resolve) return;
+    clearTimeout(this.pendingFlow.timer);
+    this.pendingFlow = null;
+  }
+  /** Complete a parked flow, if there is one. Safe to call unconditionally.
+   *  Closes the parked window (if still open) so an out-of-window outcome —
+   *  the gate refusal or a real session — never leaves it orphaned next to a
+   *  second window presenting that outcome. */
+  settlePendingFlow(session) {
+    const parked = this.pendingFlow;
+    if (!parked) return;
+    this.pendingFlow = null;
+    clearTimeout(parked.timer);
+    if (parked.win && !parked.win.isDestroyed()) {
+      parked.win.removeAllListeners("closed");
+      parked.win.close();
+    }
+    parked.resolve(session);
+  }
+  /**
+   * May this person see the app?
+   *
+   * READ from the server, never computed here. The rule
+   * `!paywallEnabled || entitlement === 'active'` once lived in this SDK, in
+   * the JS SDK and in Swift — three copies, each found wrong on a different
+   * day. The JS copy answered `true` while its config was still loading, so a
+   * plan-less user walked into a paid app on every page load (2026-08-18).
+   * `/api/sdk/auth/user` now ships the conclusion so it cannot recur.
+   *
+   * The fallback is COMPATIBILITY, not a second source of truth: an older
+   * backend simply does not send `allowed_in`, and treating absent as `false`
+   * would lock every user out of an app running this SDK ahead of the backend.
+   * Delete it once the field is everywhere. Note `=== false`: the config flag is
+   * only trustworthy once resolved, so anything else must deny.
+   *
+   * Contract: docs/sdk-access-gate-wiring.md
+   */
+  async isAllowedIn() {
+    const session = await this.getSession();
+    if (!session) return false;
+    const answer = session.user.allowedIn;
+    if (typeof answer === "boolean") return answer;
+    return this.paywallEnabled === false || session.user.entitlement === "active";
+  }
+  /**
    * True when this app has the paywall enabled (from `/api/sdk/config`). Lets a
    * launch gate decide whether a session ALONE is enough to enter (non-paywall
    * apps) or whether `hasActiveAccess()` must ALSO hold (paywall apps) — without
@@ -1209,9 +1078,15 @@ var _OneloElectronAuth = class _OneloElectronAuth {
         })
       );
       if (status !== 200) return session.user.entitlement;
-      const next = json["entitlement"] === "active" ? "active" : "none";
-      if (next !== session.user.entitlement && epoch === this.signOutEpoch) {
-        await this.saveSession({ ...session, user: { ...session.user, entitlement: next } });
+      const body = json;
+      const next = body["entitlement"] === "active" ? "active" : "none";
+      const nextAllowedIn = typeof body["allowed_in"] === "boolean" ? body["allowed_in"] : session.user.allowedIn;
+      const changed = next !== session.user.entitlement || nextAllowedIn !== session.user.allowedIn;
+      if (changed && epoch === this.signOutEpoch) {
+        await this.saveSession({
+          ...session,
+          user: { ...session.user, entitlement: next, allowedIn: nextAllowedIn }
+        });
       }
       return next;
     } catch {
@@ -1321,11 +1196,42 @@ var _OneloElectronAuth = class _OneloElectronAuth {
       return this.presentFlowError(parentWindow);
     }
     if (decision.action === "authorized") {
+      this.lastPresentedSurface = null;
       if (this.paywallEnabled) await this.revalidateEntitlement().catch(() => {
       });
       return this.getSession();
     }
+    this.lastPresentedSurface = decision.surface || null;
+    await this.rememberHostedOrigin(decision.url);
     return this.presentHostedUrl(decision.url, parentWindow);
+  }
+  /** Origin (`host`) serving this app's hosted surfaces, as last named by the
+   *  backend. PERSISTED because a magic link can relaunch a killed process: the
+   *  deep link then arrives before anything has spoken to the backend, and with
+   *  no stored value there would be nothing to check against. */
+  async rememberHostedOrigin(url) {
+    try {
+      const u = new URL(url);
+      if (u.protocol !== "https:" || !u.hostname) return;
+      await this.storage.set(HOSTED_ORIGIN_KEY, u.hostname.toLowerCase());
+    } catch {
+    }
+  }
+  /** Is this URL one of Onelo's own hosted surfaces for this app?
+   *
+   *  Fails CLOSED: an unknown origin, a non-https URL, or no remembered anchor
+   *  all answer false. A false negative costs one re-resolve back to sign-in; a
+   *  false positive renders an attacker's page inside this app's own sign-in
+   *  window, and any process on the machine can hand us a custom-scheme URL. */
+  async isOneloHostedSurface(url) {
+    try {
+      const u = new URL(url);
+      if (u.protocol !== "https:") return false;
+      const known = await this.storage.get(HOSTED_ORIGIN_KEY);
+      return !!known && u.hostname.toLowerCase() === known;
+    } catch {
+      return false;
+    }
   }
   /**
    * Present any Onelo-hosted flow URL (sign-in, store, …) in an in-app
@@ -1340,6 +1246,7 @@ var _OneloElectronAuth = class _OneloElectronAuth {
   async presentHostedUrl(hostedUrl, parentWindow, title) {
     return new Promise((resolve, reject) => {
       import("electron").then(({ BrowserWindow }) => {
+        const { width: winWidth, minWidth: winMinWidth } = hostedWindowSize(hostedUrl);
         const win = new BrowserWindow({
           // The hosted sign-up form (email + password + confirm + CTA + "Powered
           // by Onelo" footer) is taller than the old fixed 640 → the footer got
@@ -1348,9 +1255,9 @@ var _OneloElectronAuth = class _OneloElectronAuth {
           // shrunk below the point where content clips (resizable:true is what
           // makes minWidth/minHeight actually bind). Matches the feedback window
           // (720 / min 680) and Swift's 440-min-width.
-          width: 480,
+          width: winWidth,
           height: 720,
-          minWidth: 440,
+          minWidth: winMinWidth,
           minHeight: 680,
           parent: parentWindow ?? void 0,
           modal: !!parentWindow,
@@ -1364,6 +1271,7 @@ var _OneloElectronAuth = class _OneloElectronAuth {
           webPreferences: { nodeIntegration: false, contextIsolation: true },
           title: title ?? this.appName ?? "Sign in"
         });
+        this.parkPendingFlow(resolve, win);
         win.loadURL(hostedUrl);
         win.setMenuBarVisibility(false);
         win.webContents.setWindowOpenHandler(({ url }) => {
@@ -1381,10 +1289,35 @@ var _OneloElectronAuth = class _OneloElectronAuth {
             return false;
           }
         };
+        const schemePrefix = `${this.protocol.toLowerCase()}://`;
         const handleNav = (event, url) => {
-          if (url.startsWith(`${this.protocol}://`)) {
+          if (url.toLowerCase().startsWith(schemePrefix)) {
+            let expired = false;
+            try {
+              expired = isExpiredAuthError(new URL(url).searchParams.get("error"));
+            } catch {
+            }
+            if (expired) {
+              event.preventDefault();
+              this.resolveFlow().then(async (decision) => {
+                if (decision.action === "present") {
+                  win.loadURL(decision.url);
+                  return;
+                }
+                if (this.paywallEnabled) await this.revalidateEntitlement().catch(() => {
+                });
+                const session = await this.getSession();
+                this.clearOwnParkedFlow(resolve);
+                win.removeAllListeners("closed");
+                win.close();
+                resolve(session);
+              }).catch(() => win.close());
+              return;
+            }
             win.webContents.removeListener("will-redirect", handleNav);
             win.webContents.removeListener("will-navigate", handleNav);
+            this.clearOwnParkedFlow(resolve);
+            win.removeAllListeners("closed");
             win.close();
             this.handleDeepLink(url).then((session) => {
               if (session) resolve(session);
@@ -1397,12 +1330,14 @@ var _OneloElectronAuth = class _OneloElectronAuth {
             import("electron").then(({ shell }) => shell.openExternal(url));
             win.webContents.removeListener("will-redirect", handleNav);
             win.webContents.removeListener("will-navigate", handleNav);
+            win.removeAllListeners("closed");
             win.close();
           }
         };
         win.webContents.on("will-redirect", handleNav);
         win.webContents.on("will-navigate", handleNav);
         win.on("closed", () => {
+          this.clearOwnParkedFlow(resolve);
           resolve(null);
         });
       }).catch(reject);
@@ -1528,7 +1463,25 @@ var _OneloElectronAuth = class _OneloElectronAuth {
    * Returns the session if the URL contains a valid auth code, null otherwise.
    */
   async handleDeepLink(url) {
-    const parsed = new URL(url);
+    let parsed;
+    try {
+      parsed = new URL(url);
+    } catch {
+      return null;
+    }
+    const scheme = this.protocol.replace(/:$/, "").toLowerCase();
+    if (parsed.protocol.replace(/:$/, "").toLowerCase() !== scheme) return null;
+    if (parsed.hostname.toLowerCase() !== "callback") return null;
+    const gate = parsed.searchParams.get("gate");
+    if (gate) {
+      if (!await this.isOneloHostedSurface(gate)) {
+        console.warn("[Onelo] refused a gate URL from an unknown origin");
+        this.settlePendingFlow(null);
+        return null;
+      }
+      this.settlePendingFlow(null);
+      return this.presentHostedUrl(gate, null);
+    }
     const code = parsed.searchParams.get("code");
     if (!code) return null;
     const { status, json } = await (0, import_core2.httpPost)(
@@ -1539,96 +1492,42 @@ var _OneloElectronAuth = class _OneloElectronAuth {
     if (status !== 200) {
       const detail = json?.["detail"];
       const reason = typeof detail === "string" ? detail : `HTTP ${status}`;
+      this.settlePendingFlow(null);
       throw import_core.OneloError.server(`Hosted callback failed: ${reason}`);
     }
     const session = (0, import_core2.mapSession)(json);
     await this.saveSession(session);
+    this.settlePendingFlow(session);
     return session;
   }
   /**
-   * Show a built-in auth UI adapted to the tenant's plan.
+   * Open the Onelo-hosted sign-in page and complete the flow.
    *
-   * - Free plan (`allowCustomBranding === false`): delegates to `presentAuthWindow` — shows the
-   *   Onelo-hosted page (with Onelo branding).
-   * - Paid plan (`allowCustomBranding === true`): opens a modal BrowserWindow with a built-in
-   *   email/password form that matches the app's name and logo.
+   * ALWAYS hosted, on every plan. This used to branch on `allowCustomBranding`
+   * and render an inline email/password form the SDK generated itself
+   * (`auth-view-html.ts`, deleted 2026-08-19) — so the SAME call produced a
+   * different UI depending on the tenant's plan, decided by a server flag rather
+   * than by the developer.
    *
-   * @param parentWindow  Optional parent BrowserWindow (centers/modals the auth window).
-   * @returns             Resolves with a session after successful sign-in or sign-up.
+   * That inversion made a PAID tenant strictly worse off than a free one. The
+   * inline form had no OAuth buttons, no "Forgot password?", no legal consent
+   * gate (a developer relying on Onelo for GDPR consent simply did not get it)
+   * and received no server-side auth rules, including the Apple App Store
+   * sign-up gate. What the plan actually buys is hiding the Onelo footer — which
+   * the BACKEND does, on the hosted page.
+   *
+   * Custom UI is untouched and is a different thing entirely: a developer builds
+   * their own screen and calls `signIn()` / `signUp()` directly. Those methods
+   * are public and unchanged. What is gone is the SDK substituting a second,
+   * lesser UI of its own without being asked.
+   *
+   * Parity: Swift `OneloAuthView`, Flutter `OneloAuthView`, `@onelo/js`
+   * `loadAuthView` — all hosted-only. See docs/sdk-access-gate-wiring.md.
    */
   async loadAuthView(parentWindow) {
     await this.waitReady();
     if (this.isRevoked) throw import_core.OneloError.invalidKey("Application key has been revoked");
-    if (!this.allowCustomBranding) {
-      return this.presentAuthWindow(parentWindow);
-    }
-    const html = generateAuthViewHtml();
-    return new Promise((resolve, reject) => {
-      import("electron").then(({ BrowserWindow, ipcMain }) => {
-        const win = new BrowserWindow({
-          // Custom paid-plan inline form (sign-up mode adds a confirm-password
-          // field) — give it the same enforced floor as the hosted window so no
-          // field/CTA clips.
-          width: 480,
-          height: 680,
-          minWidth: 440,
-          minHeight: 640,
-          parent: parentWindow ?? void 0,
-          modal: !!parentWindow,
-          resizable: true,
-          minimizable: false,
-          maximizable: false,
-          title: this.appName,
-          webPreferences: {
-            nodeIntegration: false,
-            contextIsolation: true,
-            preload: import_path3.default.join(__dirname, "auth-view-preload.js")
-          }
-        });
-        win.setMenuBarVisibility(false);
-        win.loadURL("data:text/html;charset=utf-8," + encodeURIComponent(html));
-        ipcMain.handle("__onelo_auth_view:getConfig", () => ({
-          appName: this.appName,
-          appLogoUrl: this.appLogoUrl,
-          allowCustomBranding: this.allowCustomBranding
-        }));
-        ipcMain.handle("__onelo_auth_view:signIn", async (_event, email, password) => {
-          try {
-            const session = await this.signIn(email, password);
-            setImmediate(() => {
-              if (!win.isDestroyed()) win.close();
-            });
-            resolve(session);
-            return { success: true, session };
-          } catch (err) {
-            const msg = err instanceof Error ? err.message : String(err);
-            return { success: false, error: msg };
-          }
-        });
-        ipcMain.handle("__onelo_auth_view:signUp", async (_event, email, password) => {
-          try {
-            const session = await this.signUp(email, password);
-            setImmediate(() => {
-              if (!win.isDestroyed()) win.close();
-            });
-            resolve(session);
-            return { success: true, session };
-          } catch (err) {
-            const msg = err instanceof Error ? err.message : String(err);
-            return { success: false, error: msg };
-          }
-        });
-        const cleanup = () => {
-          ipcMain.removeHandler("__onelo_auth_view:getConfig");
-          ipcMain.removeHandler("__onelo_auth_view:signIn");
-          ipcMain.removeHandler("__onelo_auth_view:signUp");
-        };
-        win.on("closed", () => {
-          cleanup();
-          resolve(null);
-        });
-      }).catch(reject);
-    });
+    return this.presentAuthWindow(parentWindow);
   }
   // NOTE: a legacy `getOAuthUrl()` that called `@supabase/supabase-js`
   // `signInWithOAuth` directly was removed — it bypassed the Onelo backend OAuth
@@ -1747,8 +1646,8 @@ init_instance_id();
 function cacheFile() {
   try {
     const { app } = require("electron");
-    const path2 = require("path");
-    return path2.join(app.getPath("userData"), "onelo", "features.json");
+    const path = require("path");
+    return path.join(app.getPath("userData"), "onelo", "features.json");
   } catch {
     return null;
   }
@@ -1772,14 +1671,14 @@ function writeFeatureCache(publishableKey, userId, snapshot) {
   if (!file) return;
   try {
     const fs = require("fs");
-    const path2 = require("path");
+    const path = require("path");
     let all = {};
     try {
       all = JSON.parse(fs.readFileSync(file, "utf8"));
     } catch {
     }
     all[keyFor(publishableKey, userId)] = snapshot;
-    fs.mkdirSync(path2.dirname(file), { recursive: true });
+    fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.writeFileSync(file, JSON.stringify(all));
   } catch {
   }
@@ -3160,9 +3059,15 @@ var _OneloElectronCustomerPortal = class _OneloElectronCustomerPortal {
           // resume, manage) + an enforced floor so nothing clips. Same sizing
           // as the auth + feedback windows (720 / min 440×680; resizable makes
           // the min bind).
-          width: 480,
+          // Wide, like the store: the portal's content column is a fixed
+          // 432px that does not grow, so in a 480px window it touches both
+          // edges and reads as enormous even though every size is exactly as
+          // configured (measured 2026-08-19). Given room, it looks like the
+          // same page does in a browser. Kept in step with
+          // `hostedWindowSize()` in auth.ts, which sizes the store window.
+          width: 780,
           height: 720,
-          minWidth: 440,
+          minWidth: 560,
           minHeight: 680,
           parent: parentWindow,
           modal: !!parentWindow,
@@ -3660,8 +3565,7 @@ var OneloStore = class {
     );
     if (status === 401) throw import_core.OneloError.invalidKey("Store rejected the publishable key");
     if (status !== 200) {
-      const j = json;
-      const code = j?.error ?? j?.detail;
+      const code = (0, import_core5.extractErrorCode)(json);
       throw import_core.OneloError.server(`Failed to initiate store flow: HTTP ${status}${code ? ` (${code})` : ""}`);
     }
     const storeUrl = json["store_url"];
@@ -3719,8 +3623,7 @@ var OneloStore = class {
     );
     if (status === 401) throw import_core.OneloError.notAuthenticated();
     if (status !== 200) {
-      const j = json;
-      const code = j?.error ?? j?.detail;
+      const code = (0, import_core5.extractErrorCode)(json);
       throw import_core.OneloError.server(`Failed to initiate upgrade: HTTP ${status}${code ? ` (${code})` : ""}`);
     }
     const upgradeUrl = json["upgrade_url"];

@@ -1,6 +1,7 @@
 {
   "name": "@onelo/electron",
-  "version": "0.40.0",
+  "version": "0.46.1",
+  "license": "MIT",
   "description": "Onelo Electron SDK",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",

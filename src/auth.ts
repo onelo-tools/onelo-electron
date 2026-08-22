@@ -1,10 +1,8 @@
-import path from 'path'
 import { generateCodeVerifier, generateCodeChallenge, httpGet, httpPost, checkHostedFlowRequired, mapSession, TOKEN_KEYS } from '@onelo/core'
 import type { OneloEntitlement } from '@onelo/core'
 import { SecureTokenStorage } from './storage'
 import type { OneloElectronConfig, OneloElectronSession, OneloElectronUser, ResolvedSDKConfig } from './types'
 import { OneloError } from './types'
-import { generateAuthViewHtml } from './auth-view-html'
 import { sdkHeaders } from './sdk-headers'
 import { getCachedCodesignFingerprint } from './codesign'
 import type { OneloEventStream } from './event-stream'
@@ -86,7 +84,62 @@ async function resolveConfig(
   }
 }
 
+/**
+ * Is this `?error=` value the hosted page saying its addressing token is spent?
+ *
+ * NOT a catch-all: a genuine failure must still surface as an error. Reloading
+ * on every error would loop forever on one. Exported so the rule is tested
+ * directly rather than re-implemented in a test, which would stay green after
+ * the behaviour was deleted.
+ */
+/**
+ * How wide a window should a hosted surface get?
+ *
+ * The store and the portal are laid out as a fixed content column — 432px for
+ * the portal, `card_max_width` (360 default) for store cards — which does NOT
+ * grow with the viewport. In a browser that column sits centred in whitespace
+ * and reads as a modest card. In a 480px window it IS the window: content
+ * touches both edges, two and a half cards fit, and everything reads as
+ * enormous even though every measured size is exactly what the tenant
+ * configured (measured 2026-08-19 — nothing was scaled up, the container was
+ * too narrow).
+ *
+ * Sign-in is different and stays narrow: it is a single 300px form column that
+ * looks right in a slim window and lost in a wide one.
+ *
+ * Decided from the URL rather than a parameter on purpose — `presentHostedUrl`
+ * is reached from four call sites including the Access Gate deep link, and a
+ * parameter is something a fifth one would forget.
+ */
+export function hostedWindowSize(url: string): { width: number; minWidth: number } {
+  let path = ''
+  try {
+    path = new URL(url).pathname.toLowerCase()
+  } catch {
+    // Unparsable: the narrow default is the safe answer — it is what every
+    // surface used before this existed.
+    return { width: 480, minWidth: 440 }
+  }
+  const isWideSurface = path.startsWith('/store/') || path.startsWith('/customer/portal')
+  return isWideSurface ? { width: 780, minWidth: 560 } : { width: 480, minWidth: 440 }
+}
+
+export function isExpiredAuthError(err: string | null | undefined): boolean {
+  return err === 'invalid_token' || err === 'expired_token' || err === 'token_expired'
+}
+
 // ── OneloElectronAuth ────────────────────────────────────────────────────────
+
+/** Storage slot for the hosted-surface origin — the trust anchor for a
+ *  deep-linked gate URL. Namespaced like the token keys so a `clear()` on
+ *  sign-out takes it with everything else. */
+const HOSTED_ORIGIN_KEY = 'onelo_hosted_origin'
+
+/** How long to wait for the browser round-trip before giving up on a parked
+ *  flow. Generous on purpose: a provider sign-in can involve a password, 2FA and
+ *  an account chooser. On expiry the flow resolves `null` — "nothing happened",
+ *  which is what a caller re-checking real state will conclude anyway. */
+const OAUTH_RETURN_TIMEOUT_MS = 5 * 60 * 1000
 
 export class OneloElectronAuth {
   private storage: SecureTokenStorage
@@ -161,6 +214,20 @@ export class OneloElectronAuth {
   /** Plan-gated enabled OAuth providers (google/github/apple) from
    *  /api/sdk/config. Empty when social is disabled. Parity with Swift. */
   oauthProviders: string[] = []
+  /**
+   * Which hosted surface `presentAuthWindow()` last opened: `sign_in`, `store`,
+   * `no_plan`, or null when nothing was presented (the caller was already
+   * `authorized`, or the flow never got that far).
+   *
+   * `/api/sdk/flow/init`'s `surface` was read and immediately discarded, so a
+   * host app that got `null` back from `presentAuthWindow()` could not tell
+   * "user cancelled sign-in" from "user has no plan and closed the no_plan
+   * screen" — both close the SAME window the SAME way (`win.on('closed')` →
+   * `resolve(null)`). The return type stays `OneloElectronSession | null` —
+   * this is additive, reading it is optional. Parity with JS's
+   * `lastPresentedSurface`.
+   */
+  lastPresentedSurface: string | null = null
 
   constructor(config: OneloElectronConfig) {
     this.storage = new SecureTokenStorage()
@@ -316,6 +383,9 @@ export class OneloElectronAuth {
   }
 
   async signOut(): Promise<void> {
+    // A sign-out abandons any flow still waiting on the browser; leaving it
+    // parked would resolve a caller minutes later, after the world moved on.
+    this.settlePendingFlow(null)
     // Bump the epoch BEFORE any await so an in-flight refresh/revalidate can't
     // resurrect the session (epoch guard).
     this.signOutEpoch++
@@ -416,6 +486,99 @@ export class OneloElectronAuth {
     return session?.user.entitlement === 'active'
   }
 
+  /** A `loadAuthView()`/`presentAuthWindow()` call whose flow LEFT this app for
+   *  the system browser and has not come back yet. See `parkPendingFlow`.
+   *  `win` is the still-open hosted window it started in — a magic link (like
+   *  OAuth) is finished by a deep-link that lands OUTSIDE that window (email
+   *  client → system browser → this app's protocol handler), so nothing
+   *  in-window ever navigates it away. Tracking it here lets settlePendingFlow
+   *  close it once the flow is actually decided, instead of leaving it open as
+   *  an orphaned second "Check your inbox" window while a NEW window (the
+   *  deep-link's own outcome — success or the no-plan gate) opens next to it. */
+  private pendingFlow: { resolve: (s: OneloElectronSession | null) => void; timer: ReturnType<typeof setTimeout>; win: import('electron').BrowserWindow | null } | null = null
+
+  /**
+   * Hold the flow open across a hand-off to the system browser — an OAuth
+   * provider page, or a magic link opened from the user's email client. Both
+   * leave this app's hosted window open (or, for OAuth, about to close) with no
+   * in-window navigation to react to; the eventual outcome arrives later via
+   * `handleDeepLink`, disconnected from whatever `presentHostedUrl` call is
+   * still waiting.
+   *
+   * It used to resolve `null` at hand-off time, which is the same value the SDK
+   * uses for "the user cancelled". A host app therefore could not tell "nothing
+   * happened" from "a session is on its way", and the obvious
+   * `await loadAuthView(); mainWindow.show()` revealed the app as "Not signed
+   * in" while the account chooser was still open in Safari (Adrian, 2026-08-19).
+   *
+   * Now the promise stays pending until `handleDeepLink` settles it, matching
+   * Swift (ASWebAuthenticationSession stays alive) and React Native (the modal
+   * stays open). `null` goes back to meaning only "no session came of it".
+   */
+  private parkPendingFlow(resolve: (s: OneloElectronSession | null) => void, win: import('electron').BrowserWindow | null = null): void {
+    // Only one flow can be outstanding; a second hand-off abandons the first.
+    this.settlePendingFlow(null)
+    const timer = setTimeout(() => this.settlePendingFlow(null), OAUTH_RETURN_TIMEOUT_MS)
+    // Never hold the process open on this timer — an app that is quitting must
+    // not be kept alive by an abandoned sign-in.
+    if (typeof (timer as { unref?: () => void }).unref === 'function') {
+      (timer as unknown as { unref: () => void }).unref()
+    }
+    this.pendingFlow = { resolve, timer, win }
+  }
+
+  /** Drop this window's parked entry WITHOUT resolving it — for when the
+   *  window is settling itself in-place (e.g. an in-window deep-link code, or
+   *  the expired-token reload) and would otherwise leave a stale parked entry
+   *  pointing at a window that's already closing. */
+  private clearOwnParkedFlow(resolve: (s: OneloElectronSession | null) => void): void {
+    if (this.pendingFlow?.resolve !== resolve) return
+    clearTimeout(this.pendingFlow.timer)
+    this.pendingFlow = null
+  }
+
+  /** Complete a parked flow, if there is one. Safe to call unconditionally.
+   *  Closes the parked window (if still open) so an out-of-window outcome —
+   *  the gate refusal or a real session — never leaves it orphaned next to a
+   *  second window presenting that outcome. */
+  private settlePendingFlow(session: OneloElectronSession | null): void {
+    const parked = this.pendingFlow
+    if (!parked) return
+    this.pendingFlow = null
+    clearTimeout(parked.timer)
+    if (parked.win && !parked.win.isDestroyed()) {
+      parked.win.removeAllListeners('closed')
+      parked.win.close()
+    }
+    parked.resolve(session)
+  }
+
+  /**
+   * May this person see the app?
+   *
+   * READ from the server, never computed here. The rule
+   * `!paywallEnabled || entitlement === 'active'` once lived in this SDK, in
+   * the JS SDK and in Swift — three copies, each found wrong on a different
+   * day. The JS copy answered `true` while its config was still loading, so a
+   * plan-less user walked into a paid app on every page load (2026-08-18).
+   * `/api/sdk/auth/user` now ships the conclusion so it cannot recur.
+   *
+   * The fallback is COMPATIBILITY, not a second source of truth: an older
+   * backend simply does not send `allowed_in`, and treating absent as `false`
+   * would lock every user out of an app running this SDK ahead of the backend.
+   * Delete it once the field is everywhere. Note `=== false`: the config flag is
+   * only trustworthy once resolved, so anything else must deny.
+   *
+   * Contract: docs/sdk-access-gate-wiring.md
+   */
+  async isAllowedIn(): Promise<boolean> {
+    const session = await this.getSession()
+    if (!session) return false
+    const answer = session.user.allowedIn
+    if (typeof answer === 'boolean') return answer
+    return this.paywallEnabled === false || session.user.entitlement === 'active'
+  }
+
   /**
    * True when this app has the paywall enabled (from `/api/sdk/config`). Lets a
    * launch gate decide whether a session ALONE is enough to enter (non-paywall
@@ -447,12 +610,23 @@ export class OneloElectronAuth {
         }),
       )
       if (status !== 200) return session.user.entitlement
-      const next: OneloEntitlement =
-        (json as Record<string, unknown>)['entitlement'] === 'active' ? 'active' : 'none'
+      const body = json as Record<string, unknown>
+      const next: OneloEntitlement = body['entitlement'] === 'active' ? 'active' : 'none'
+      // Persist the ANSWER too, not only the ingredient. Refreshing entitlement
+      // alone left a paying customer holding a stored "not allowed" — locked out
+      // by the very call meant to let them in (found in JS/Swift/Flutter,
+      // 2026-08-19). Absent stays undefined so the fallback above still applies.
+      const nextAllowedIn = typeof body['allowed_in'] === 'boolean'
+        ? (body['allowed_in'] as boolean)
+        : session.user.allowedIn
       // Don't resurrect a session that was signed out while this request was in
       // flight (epoch guard, parity with Swift/JS).
-      if (next !== session.user.entitlement && epoch === this.signOutEpoch) {
-        await this.saveSession({ ...session, user: { ...session.user, entitlement: next } })
+      const changed = next !== session.user.entitlement || nextAllowedIn !== session.user.allowedIn
+      if (changed && epoch === this.signOutEpoch) {
+        await this.saveSession({
+          ...session,
+          user: { ...session.user, entitlement: next, allowedIn: nextAllowedIn },
+        })
       }
       return next
     } catch {
@@ -586,10 +760,52 @@ export class OneloElectronAuth {
       // return the current session. Parity with JS loadAuthView (auth.ts:166-171)
       // + Swift's `.authorized` case — an already-entitled user no longer gets a
       // redundant sign-in window.
+      this.lastPresentedSurface = null
       if (this.paywallEnabled) await this.revalidateEntitlement().catch(() => {})
       return this.getSession()
     }
+    // Record WHICH surface is about to open, so a caller reading `null` back
+    // from this call can tell "cancelled sign-in" from "closed the no_plan
+    // screen" — both close this same window the same way.
+    this.lastPresentedSurface = decision.surface || null
+    // Remember WHERE Onelo hosts this app's surfaces. The backend just told us,
+    // so it is never assembled or assumed — and it is the only thing a
+    // deep-linked gate URL can be checked against before being loaded in a
+    // window of this app.
+    await this.rememberHostedOrigin(decision.url)
     return this.presentHostedUrl(decision.url, parentWindow)
+  }
+
+  /** Origin (`host`) serving this app's hosted surfaces, as last named by the
+   *  backend. PERSISTED because a magic link can relaunch a killed process: the
+   *  deep link then arrives before anything has spoken to the backend, and with
+   *  no stored value there would be nothing to check against. */
+  private async rememberHostedOrigin(url: string): Promise<void> {
+    try {
+      const u = new URL(url)
+      if (u.protocol !== 'https:' || !u.hostname) return
+      await this.storage.set(HOSTED_ORIGIN_KEY, u.hostname.toLowerCase())
+    } catch {
+      // Never fail a sign-in over the anchor. Losing it only costs a fail-closed
+      // refusal on a later cold-start deep link, which re-resolves to sign-in.
+    }
+  }
+
+  /** Is this URL one of Onelo's own hosted surfaces for this app?
+   *
+   *  Fails CLOSED: an unknown origin, a non-https URL, or no remembered anchor
+   *  all answer false. A false negative costs one re-resolve back to sign-in; a
+   *  false positive renders an attacker's page inside this app's own sign-in
+   *  window, and any process on the machine can hand us a custom-scheme URL. */
+  private async isOneloHostedSurface(url: string): Promise<boolean> {
+    try {
+      const u = new URL(url)
+      if (u.protocol !== 'https:') return false
+      const known = await this.storage.get(HOSTED_ORIGIN_KEY)
+      return !!known && u.hostname.toLowerCase() === known
+    } catch {
+      return false
+    }
   }
 
   /**
@@ -609,6 +825,9 @@ export class OneloElectronAuth {
   ): Promise<OneloElectronSession | null> {
     return new Promise((resolve, reject) => {
       import('electron').then(({ BrowserWindow }) => {
+        // Sized from the URL — sign-in stays slim, the store and portal get the
+        // room their fixed content column was designed to sit inside.
+        const { width: winWidth, minWidth: winMinWidth } = hostedWindowSize(hostedUrl)
         const win = new BrowserWindow({
           // The hosted sign-up form (email + password + confirm + CTA + "Powered
           // by Onelo" footer) is taller than the old fixed 640 → the footer got
@@ -617,9 +836,9 @@ export class OneloElectronAuth {
           // shrunk below the point where content clips (resizable:true is what
           // makes minWidth/minHeight actually bind). Matches the feedback window
           // (720 / min 680) and Swift's 440-min-width.
-          width: 480,
+          width: winWidth,
           height: 720,
-          minWidth: 440,
+          minWidth: winMinWidth,
           minHeight: 680,
           parent: parentWindow ?? undefined,
           modal: !!parentWindow,
@@ -633,6 +852,15 @@ export class OneloElectronAuth {
           webPreferences: { nodeIntegration: false, contextIsolation: true },
           title: title ?? this.appName ?? 'Sign in',
         })
+
+        // Park from the moment the window opens, not just at the OAuth
+        // hand-off below: a magic link is requested by an in-page state
+        // change on the hosted page itself (no navigation event fires in
+        // `win`), so this is the ONLY point that can observe "this flow may
+        // finish outside this window" before it actually does. Harmless for
+        // the ordinary in-window code/expired paths below — they clear their
+        // own parked entry via clearOwnParkedFlow before resolving directly.
+        this.parkPendingFlow(resolve, win)
 
         win.loadURL(hostedUrl)
         win.setMenuBarVisibility(false)
@@ -700,11 +928,52 @@ export class OneloElectronAuth {
           }
         }
 
+        const schemePrefix = `${this.protocol.toLowerCase()}://`
         const handleNav = (event: Electron.Event, url: string) => {
-          if (url.startsWith(`${this.protocol}://`)) {
+          // Lower-cased on BOTH sides: the OS hands the scheme back lower-cased
+          // regardless of how it was registered, so a `protocol: 'MyApp'` config
+          // made this miss the deep link entirely and the code was lost. Matches
+          // the comparison handleDeepLink already does.
+          if (url.toLowerCase().startsWith(schemePrefix)) {
+            // A hosted surface can hand the window back WITHOUT a code, saying
+            // the addressing token is spent: `?error=invalid_token`. That is what
+            // "Use a different account" on the no-plan page sends after signing
+            // the user out, and what an idle expiry sends. Reloading a FRESH
+            // hosted URL is the correct response — the flow is re-resolved
+            // server-side and now answers `sign_in`, so the user lands on a clean
+            // form instead of this window closing on them with nothing to show.
+            // Parity with Swift's `onSessionExpired` (OneloAuthView.swift).
+            let expired = false
+            try {
+              expired = isExpiredAuthError(new URL(url).searchParams.get('error'))
+            } catch {
+              // Malformed — fall through to the normal path, which returns null.
+            }
+            if (expired) {
+              event.preventDefault()
+              this.resolveFlow()
+                .then(async (decision) => {
+                  if (decision.action === 'present') { win.loadURL(decision.url); return }
+                  // `authorized` — the backend just confirmed this caller. Closing
+                  // here would trip `win.on('closed')` → resolve(null), telling the
+                  // caller "no session" for a user who HAS one. Resolve properly
+                  // first, exactly as the top-level authorized branch does.
+                  if (this.paywallEnabled) await this.revalidateEntitlement().catch(() => {})
+                  const session = await this.getSession()
+                  this.clearOwnParkedFlow(resolve)
+                  win.removeAllListeners('closed')
+                  win.close()
+                  resolve(session)
+                })
+                .catch(() => win.close())
+              return
+            }
+
             // Deep-link back to the app — success path.
             win.webContents.removeListener('will-redirect', handleNav)
             win.webContents.removeListener('will-navigate', handleNav)
+            this.clearOwnParkedFlow(resolve)
+            win.removeAllListeners('closed')
             win.close()
             this.handleDeepLink(url)
               .then((session) => {
@@ -724,6 +993,10 @@ export class OneloElectronAuth {
             import('electron').then(({ shell }) => shell.openExternal(url))
             win.webContents.removeListener('will-redirect', handleNav)
             win.webContents.removeListener('will-navigate', handleNav)
+            // Already parked when this window was opened (see above) — just
+            // drop the 'closed' listener so closing it here doesn't resolve
+            // null, which is exactly the premature answer parking removes.
+            win.removeAllListeners('closed')
             win.close()
           }
         }
@@ -731,6 +1004,7 @@ export class OneloElectronAuth {
         win.webContents.on('will-navigate', handleNav)
 
         win.on('closed', () => {
+          this.clearOwnParkedFlow(resolve)
           resolve(null)
         })
       }).catch(reject)
@@ -882,7 +1156,56 @@ export class OneloElectronAuth {
    * Returns the session if the URL contains a valid auth code, null otherwise.
    */
   async handleDeepLink(url: string): Promise<OneloElectronSession | null> {
-    const parsed = new URL(url)
+    let parsed: URL
+    try {
+      parsed = new URL(url)
+    } catch {
+      // Hosts funnel EVERY incoming url through here (`app.on('open-url')`,
+      // `second-instance`), so a malformed one must be ignored, not thrown at.
+      return null
+    }
+
+    // Smuggling guard — parity with Swift `handleAuthCallback` and Android
+    // `Onelo.handleRedirect`, both of which require the canonical
+    // `<scheme>://callback` shape. Without it ANY page could navigate to
+    // `myapp://anything?code=…` and push a foreign one-time code into the
+    // exchange below; the protocol is registered to this app, so the OS delivers
+    // it. Scheme comparison is case-insensitive because the OS may hand the
+    // scheme back lower-cased regardless of how it was registered.
+    //
+    // `URL` keeps the trailing colon on `protocol` ("myapp:") and puts the
+    // authority in `hostname` for a custom scheme.
+    const scheme = this.protocol.replace(/:$/, '').toLowerCase()
+    if (parsed.protocol.replace(/:$/, '').toLowerCase() !== scheme) return null
+    if (parsed.hostname.toLowerCase() !== 'callback') return null
+
+    // ── A refusal, not a sign-in ────────────────────────────────────────────
+    // A sign-in that finishes OUTSIDE this app — a magic link opened in the
+    // system browser — can be turned down by the Access Gate, and then there is
+    // deliberately no code: the backend withholds it rather than let the app
+    // decide. The refusal still has to REACH the app, or it is only ever visible
+    // in the browser tab while the app waits on "Check your inbox" forever
+    // (Turingo/Swift, 2026-08-19 — same contract, same failure).
+    //
+    // Nothing here reads or branches on the URL: WHICH screen it is, and what it
+    // says, was settled server-side. Presented standalone (`null` parent) —
+    // there is no main window to attach to on a cold start.
+    const gate = parsed.searchParams.get('gate')
+    if (gate) {
+      if (!(await this.isOneloHostedSurface(gate))) {
+        console.warn('[Onelo] refused a gate URL from an unknown origin')
+        this.settlePendingFlow(null)
+        return null
+      }
+      // Settle the parked flow FIRST, with no session: the caller asked "did
+      // this sign-in produce access?" and the answer is no. It then re-checks
+      // state and keeps the app window hidden, while the surface below explains
+      // why. Settling after would leave the caller waiting on a window the user
+      // may never close.
+      this.settlePendingFlow(null)
+      return this.presentHostedUrl(gate, null)
+    }
+
     const code = parsed.searchParams.get('code')
     if (!code) return null // not an auth deep-link — nothing to exchange
     const { status, json } = await httpPost(
@@ -898,106 +1221,49 @@ export class OneloElectronAuth {
       // above — that's "this deep-link isn't ours", not a failure.)
       const detail = (json as Record<string, unknown> | null)?.['detail']
       const reason = typeof detail === 'string' ? detail : `HTTP ${status}`
+      // The flow is over, badly. Release the parked caller with "no session"
+      // rather than leaving it hanging until the timeout — it re-checks state
+      // and keeps the app hidden, which is the right outcome either way. The
+      // throw still reaches the host's open-url handler with the real reason.
+      this.settlePendingFlow(null)
       throw OneloError.server(`Hosted callback failed: ${reason}`)
     }
     const session = mapSession(json as Record<string, unknown>)
     await this.saveSession(session)
+    // Hand the session to whoever is still awaiting the flow this deep link
+    // belongs to — the OAuth hand-off parked it when the browser took over.
+    this.settlePendingFlow(session)
     return session
   }
 
   /**
-   * Show a built-in auth UI adapted to the tenant's plan.
+   * Open the Onelo-hosted sign-in page and complete the flow.
    *
-   * - Free plan (`allowCustomBranding === false`): delegates to `presentAuthWindow` — shows the
-   *   Onelo-hosted page (with Onelo branding).
-   * - Paid plan (`allowCustomBranding === true`): opens a modal BrowserWindow with a built-in
-   *   email/password form that matches the app's name and logo.
+   * ALWAYS hosted, on every plan. This used to branch on `allowCustomBranding`
+   * and render an inline email/password form the SDK generated itself
+   * (`auth-view-html.ts`, deleted 2026-08-19) — so the SAME call produced a
+   * different UI depending on the tenant's plan, decided by a server flag rather
+   * than by the developer.
    *
-   * @param parentWindow  Optional parent BrowserWindow (centers/modals the auth window).
-   * @returns             Resolves with a session after successful sign-in or sign-up.
+   * That inversion made a PAID tenant strictly worse off than a free one. The
+   * inline form had no OAuth buttons, no "Forgot password?", no legal consent
+   * gate (a developer relying on Onelo for GDPR consent simply did not get it)
+   * and received no server-side auth rules, including the Apple App Store
+   * sign-up gate. What the plan actually buys is hiding the Onelo footer — which
+   * the BACKEND does, on the hosted page.
+   *
+   * Custom UI is untouched and is a different thing entirely: a developer builds
+   * their own screen and calls `signIn()` / `signUp()` directly. Those methods
+   * are public and unchanged. What is gone is the SDK substituting a second,
+   * lesser UI of its own without being asked.
+   *
+   * Parity: Swift `OneloAuthView`, Flutter `OneloAuthView`, `@onelo/js`
+   * `loadAuthView` — all hosted-only. See docs/sdk-access-gate-wiring.md.
    */
   async loadAuthView(parentWindow?: import('electron').BrowserWindow | null): Promise<OneloElectronSession | null> {
     await this.waitReady()
     if (this.isRevoked) throw OneloError.invalidKey('Application key has been revoked')
-
-    if (!this.allowCustomBranding) {
-      return this.presentAuthWindow(parentWindow)
-    }
-
-    const html = generateAuthViewHtml()
-
-    return new Promise((resolve, reject) => {
-      import('electron').then(({ BrowserWindow, ipcMain }) => {
-        const win = new BrowserWindow({
-          // Custom paid-plan inline form (sign-up mode adds a confirm-password
-          // field) — give it the same enforced floor as the hosted window so no
-          // field/CTA clips.
-          width: 480,
-          height: 680,
-          minWidth: 440,
-          minHeight: 640,
-          parent: parentWindow ?? undefined,
-          modal: !!parentWindow,
-          resizable: true,
-          minimizable: false,
-          maximizable: false,
-          title: this.appName,
-          webPreferences: {
-            nodeIntegration: false,
-            contextIsolation: true,
-            preload: path.join(__dirname, 'auth-view-preload.js'),
-          },
-        })
-
-        win.setMenuBarVisibility(false)
-        win.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(html))
-
-        // IPC: provide config to the renderer
-        ipcMain.handle('__onelo_auth_view:getConfig', () => ({
-          appName: this.appName,
-          appLogoUrl: this.appLogoUrl,
-          allowCustomBranding: this.allowCustomBranding,
-        }))
-
-        // IPC: sign in
-        ipcMain.handle('__onelo_auth_view:signIn', async (_event, email: string, password: string) => {
-          try {
-            const session = await this.signIn(email, password)
-            // Close window after resolving so the renderer gets the success response
-            setImmediate(() => { if (!win.isDestroyed()) win.close() })
-            resolve(session)
-            return { success: true, session }
-          } catch (err) {
-            const msg = err instanceof Error ? err.message : String(err)
-            return { success: false, error: msg }
-          }
-        })
-
-        // IPC: sign up
-        ipcMain.handle('__onelo_auth_view:signUp', async (_event, email: string, password: string) => {
-          try {
-            const session = await this.signUp(email, password)
-            setImmediate(() => { if (!win.isDestroyed()) win.close() })
-            resolve(session)
-            return { success: true, session }
-          } catch (err) {
-            const msg = err instanceof Error ? err.message : String(err)
-            return { success: false, error: msg }
-          }
-        })
-
-        const cleanup = () => {
-          ipcMain.removeHandler('__onelo_auth_view:getConfig')
-          ipcMain.removeHandler('__onelo_auth_view:signIn')
-          ipcMain.removeHandler('__onelo_auth_view:signUp')
-        }
-
-        win.on('closed', () => {
-          cleanup()
-          resolve(null)
-        })
-      }).catch(reject)
-    })
+    return this.presentAuthWindow(parentWindow)
   }
 
   // NOTE: a legacy `getOAuthUrl()` that called `@supabase/supabase-js`
@@ -1010,6 +1276,19 @@ export class OneloElectronAuth {
     await this.waitReady()
     const body: Record<string, unknown> = { publishableKey: this.publishableKey, email }
     if (redirectTo) body.redirectTo = redirectTo
+    // NOTE — no `code_challenge` here, deliberately (2026-08-18).
+    // Binding a PKCE challenge to a magic link is the RIGHT design, and the
+    // backend already supports it. But it cannot ship until the verifier is
+    // PERSISTED in a magic-link-specific slot (Keychain / EncryptedSharedPrefs /
+    // safeStorage / secure storage), the way Swift's `_beginFlowPKCE` does it.
+    // This SDK's `pkceVerifier` is in-memory and is nulled after every password
+    // sign-in and regenerated on every launch — and a magic link, by definition,
+    // is opened later, often after a relaunch. Sending a challenge against that
+    // volatile verifier makes /hosted-callback 401 with "PKCE verification
+    // failed", and the link is already marked used at consume, so the user is
+    // locked out with no recovery. A challenge-less link is weaker; a burnt link
+    // is broken. Also missing: `callback_scheme`, without which the hosted page
+    // has no channel to hand the code back to a native client at all.
     const { status } = await httpPost(`${this.apiUrl}/api/sdk/auth/magic-link`, body, sdkHeaders(this.bundleId))
     if (status !== 200) throw OneloError.server(`Magic link request failed: HTTP ${status}`)
   }

@@ -80,4 +80,27 @@ describe('OneloElectronAuth — magic link & password reset', () => {
     const body = JSON.parse((call![1] as { body: string }).body)
     expect(body.redirectTo).toBe('myapp://reset')
   })
+
+  it('sends NO code_challenge while the verifier is volatile', async () => {
+  // Deliberately ABSENT. Binding a PKCE challenge to a magic link is the right
+  // design and the backend supports it, but the verifier here is in-memory and is
+  // nulled after every password sign-in — while a magic link is opened later,
+  // usually after a relaunch. A challenge bound to a verifier that no longer
+  // exists makes /hosted-callback 401 AFTER the token is already marked used, so
+  // the link is permanently burnt and the user has no way back. Pinned so it
+  // cannot be "restored" without persisting the verifier first.
+    mockFetch.mockImplementation((url: string) => {
+      if (url && url.includes('/api/sdk/config')) return mockResponse(200, CONFIG_RESPONSE)
+      if (url && url.includes('/api/sdk/auth/magic-link')) return mockResponse(200, { success: true })
+      return mockResponse(404, {})
+    })
+    const { OneloElectronAuth } = await import('./auth')
+    const auth = new OneloElectronAuth({ publishableKey: 'onelo_pk_test', apiUrl: 'https://api.onelo.tools' })
+    await auth.whenReady()
+    await auth.sendMagicLink('ada@example.com')
+    const call = mockFetch.mock.calls.find((c) => String(c[0]).includes('/auth/magic-link'))
+    expect(call).toBeDefined()
+    const body = JSON.parse(String((call![1] as { body: string }).body))
+    expect(body.code_challenge).toBeUndefined()
+  })
 })

@@ -1,4 +1,4 @@
-import { httpGet } from '@onelo/core'
+import { httpGet, extractErrorCode } from '@onelo/core'
 import { OneloError } from './types'
 import type { OneloElectronSession } from './types'
 import { sdkHeaders } from './sdk-headers'
@@ -72,11 +72,9 @@ export class OneloStore {
     )
     if (status === 401) throw OneloError.invalidKey('Store rejected the publishable key')
     if (status !== 200) {
-      // FastAPI HTTPException serializes as {detail}; some handlers use {error}.
-      // Read both (parity with Swift's `json["error"] ?? json["detail"]`).
-      const j = json as { error?: string; detail?: string } | null
-      const code = j?.error ?? j?.detail
-      // e.g. store_not_configured (409), paywall_not_enabled (403).
+      const code = extractErrorCode(json)
+      // e.g. store_not_configured (409), paywall_not_enabled (403),
+      // in_app_store_not_allowed (409).
       throw OneloError.server(`Failed to initiate store flow: HTTP ${status}${code ? ` (${code})` : ''}`)
     }
     const storeUrl = (json as Record<string, unknown>)['store_url'] as string | undefined
@@ -144,10 +142,9 @@ export class OneloStore {
     )
     if (status === 401) throw OneloError.notAuthenticated()
     if (status !== 200) {
-      // FastAPI HTTPException serializes as {detail}; some handlers use {error}.
-      const j = json as { error?: string; detail?: string } | null
-      const code = j?.error ?? j?.detail
-      // e.g. plan_not_purchasable (404), callback_scheme_required (400).
+      const code = extractErrorCode(json)
+      // e.g. plan_not_purchasable (404), callback_scheme_required (400),
+      // in_app_store_not_allowed (409).
       throw OneloError.server(`Failed to initiate upgrade: HTTP ${status}${code ? ` (${code})` : ''}`)
     }
     const upgradeUrl = (json as Record<string, unknown>)['upgrade_url'] as string | undefined

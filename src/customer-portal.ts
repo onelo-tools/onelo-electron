@@ -181,9 +181,15 @@ export class OneloElectronCustomerPortal {
             // resume, manage) + an enforced floor so nothing clips. Same sizing
             // as the auth + feedback windows (720 / min 440×680; resizable makes
             // the min bind).
-            width: 480,
+            // Wide, like the store: the portal's content column is a fixed
+            // 432px that does not grow, so in a 480px window it touches both
+            // edges and reads as enormous even though every size is exactly as
+            // configured (measured 2026-08-19). Given room, it looks like the
+            // same page does in a browser. Kept in step with
+            // `hostedWindowSize()` in auth.ts, which sizes the store window.
+            width: 780,
             height: 720,
-            minWidth: 440,
+            minWidth: 560,
             minHeight: 680,
             parent: parentWindow,
             modal: !!parentWindow,
