@@ -9,7 +9,7 @@
  * settlePendingFlow (called from handleDeepLink) must close that window
  * instead of leaving it orphaned.
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 
 type Listener = (...args: unknown[]) => void
 
@@ -103,6 +103,32 @@ beforeEach(() => {
   FakeBrowserWindow.instances = []
 })
 
+/**
+ * Every window in this file is opened INSIDE `import('electron')`
+ * (`presentHostedUrl`, auth.ts). Under Vitest that import is resolved by the
+ * module runner, and its resolution is not guaranteed to land within a single
+ * macrotask — waiting `setTimeout(…, 0)` for it observed zero windows on a
+ * contended run, and the window then landed in `FakeBrowserWindow.instances`
+ * AFTER `beforeEach` had cleared it, i.e. inside the NEXT test. Wait for the
+ * window itself instead of for a tick: the wait then ends when the thing being
+ * waited for actually exists, on a fast machine and a loaded one alike.
+ */
+async function waitForWindows(count: number): Promise<void> {
+  for (let i = 0; i < 500 && FakeBrowserWindow.instances.length < count; i++) {
+    await new Promise((r) => setTimeout(r, 1))
+  }
+  expect(FakeBrowserWindow.instances).toHaveLength(count)
+}
+
+/** No window may outlive the test that opened it. A still-open window means a
+ *  flow is still parked (see `parkPendingFlow`) and its eventual outcome would
+ *  land in whichever test happens to run next — the exact leak this file was
+ *  failing on. Fail loudly here rather than one test later. */
+afterEach(() => {
+  const open = FakeBrowserWindow.instances.filter((w) => !w.destroyed)
+  expect(open, 'a window was left open past the end of its test').toHaveLength(0)
+})
+
 describe('a magic link returning by deep link', () => {
   it('closes the original waiting window instead of leaving it orphaned when the gate refuses', async () => {
     const auth = makeAuth()
@@ -116,22 +142,28 @@ describe('a magic link returning by deep link', () => {
     // the user requests a magic link — exactly what leaves nothing to react
     // to inside `win` when the email is opened elsewhere.
     const flowPromise = auth.presentHostedUrl(HOSTED_URL, null)
-    await new Promise((r) => setTimeout(r, 0)) // let the dynamic import('electron') settle
-    expect(FakeBrowserWindow.instances).toHaveLength(1)
+    await waitForWindows(1)
     const waitingWindow = FakeBrowserWindow.instances[0]
     expect(waitingWindow.destroyed).toBe(false)
 
     // The email link resolves in the system browser and bounces the gate
     // refusal back into the app via the OS-level deep link — completely
     // disconnected from `waitingWindow`.
-    // Not awaited: handleDeepLink's gate branch returns the SECOND window's
-    // presentHostedUrl promise, which (like a real "No active plan" screen)
-    // only resolves when a person closes it — awaiting it here would hang
-    // the test on a window nobody is driving. Settling the original window
+    // Held, not dropped: handleDeepLink's gate branch returns the SECOND
+    // window's presentHostedUrl promise, which (like a real "No active plan"
+    // screen) only resolves when a person closes it. It is driven at the end
+    // of this test rather than left running — a dangling promise here opens
+    // its window into whichever test runs next. Settling the original window
     // happens synchronously before that second window is even opened.
     const gateUrl = `${HOSTED_URL}&reason=no_plan`
-    void (auth as any).handleDeepLink(`turingo://callback?gate=${encodeURIComponent(gateUrl)}`)
-    await new Promise((r) => setTimeout(r, 0))
+    const gatePromise = (auth as any).handleDeepLink(
+      `turingo://callback?gate=${encodeURIComponent(gateUrl)}`,
+    ) as Promise<unknown>
+
+    // Exactly one NEW window (the gate/"No active plan" screen) — not a
+    // second window on top of the still-open first one.
+    await waitForWindows(2)
+    expect(FakeBrowserWindow.instances[1]).not.toBe(waitingWindow)
 
     // The original window must be closed — not left open as a stuck second
     // "Check your inbox" screen next to the new gate window.
@@ -141,10 +173,10 @@ describe('a magic link returning by deep link', () => {
     // The original presentHostedUrl caller must be released, not hang forever.
     await expect(flowPromise).resolves.toBeNull()
 
-    // Exactly one NEW window (the gate/"No active plan" screen) — not a
-    // second window on top of the still-open first one.
-    expect(FakeBrowserWindow.instances).toHaveLength(2)
-    expect(FakeBrowserWindow.instances[1]).not.toBe(waitingWindow)
+    // The person closes the gate window, which is what a real "No active plan"
+    // screen waits for. Doing it here ends the flow inside this test.
+    FakeBrowserWindow.instances[1].close()
+    await expect(gatePromise).resolves.toBeNull()
   })
 
   it('closes the original waiting window and resolves the real session on success', async () => {
@@ -155,7 +187,7 @@ describe('a magic link returning by deep link', () => {
     await (auth as any).rememberHostedOrigin(HOSTED_URL)
 
     const flowPromise = auth.presentHostedUrl(HOSTED_URL, null)
-    await new Promise((r) => setTimeout(r, 0)) // let the dynamic import('electron') settle
+    await waitForWindows(1)
     const waitingWindow = FakeBrowserWindow.instances[0]
 
     const { httpPost } = await import('@onelo/core')

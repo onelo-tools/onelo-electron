@@ -21,6 +21,7 @@ vi.mock('./storage', () => ({
   SecureTokenStorage: vi.fn().mockImplementation(() => ({
     get: vi.fn().mockResolvedValue(null),
     set: vi.fn().mockResolvedValue(undefined),
+    delete: vi.fn().mockResolvedValue(undefined),
     clear: vi.fn().mockResolvedValue(undefined),
   })),
 }))

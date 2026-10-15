@@ -19,14 +19,18 @@ import type { OneloElectronAuth } from './auth'
  * Usage:
  *   const session = await onelo.store.open(mainWindow)   // buyer ends up signed in
  *   await onelo.store.openInBrowser()                    // store in system browser
- *   await onelo.store.openUpgrade('pro')                 // upgrade in system browser
+ *   await onelo.store.openUpgrade('pro')                 // upgrade in an in-app window
  */
+/** Opens a hosted URL in the SDK's portal window and resolves when it closes. */
+export type UpgradePresenter = (url: string, parentWindow?: import('electron').BrowserWindow) => Promise<void>
+
 export class OneloStore {
   private readonly apiUrl: string
   private readonly publishableKey: string
   private readonly auth: OneloElectronAuth
   private readonly bundleId?: string
   private readonly protocol: string
+  private readonly presentUpgrade?: UpgradePresenter
 
   constructor(
     apiUrl: string,
@@ -35,11 +39,16 @@ export class OneloStore {
     /** Deep-link scheme for the checkout callback (same one auth uses). */
     protocol: string,
     bundleId?: string,
+    /** Presents the upgrade URL in the SDK's own window (#606) — wired by
+     *  `Onelo` to `customerPortal.presentUrl`. Absent (a standalone store) →
+     *  the system browser, the pre-#606 behaviour. */
+    presentUpgrade?: UpgradePresenter,
   ) {
     this.apiUrl = apiUrl
     this.publishableKey = publishableKey
     this.auth = auth
     this.bundleId = bundleId
+    this.presentUpgrade = presentUpgrade
     // Backend lowercases the callback scheme before storing, so the final
     // redirect is always lowercase — normalize once so interception matches
     // (parity with customer-portal).
@@ -77,6 +86,7 @@ export class OneloStore {
       // in_app_store_not_allowed (409).
       throw OneloError.server(`Failed to initiate store flow: HTTP ${status}${code ? ` (${code})` : ''}`)
     }
+    this.auth.brand.adopt(json) // #681: store-initiate carries brand_tokens
     const storeUrl = (json as Record<string, unknown>)['store_url'] as string | undefined
     if (!storeUrl) throw OneloError.server('Invalid store-initiate response: missing store_url')
     return storeUrl
@@ -97,7 +107,8 @@ export class OneloStore {
    */
   async open(parentWindow?: import('electron').BrowserWindow): Promise<OneloElectronSession | null> {
     const storeUrl = await this.initiateStoreFlow()
-    return this.auth.presentHostedUrl(storeUrl, parentWindow, 'Store')
+    // A dead link (#619) reopens the store on a fresh one, not on /flow/init.
+    return this.auth.presentHostedUrl(storeUrl, parentWindow, 'Store', () => this.initiateStoreFlow())
   }
 
   /**
@@ -117,15 +128,18 @@ export class OneloStore {
    * Act on an upsell (a feature's `upgradeCta`/`upgradeHint`, an "Available in
    * <plan>" tap). Requires a signed-in session. The backend is the single source
    * of truth for billing: an active subscriber is routed to a hosted plan-switch
-   * checkout, a user with no subscription to the hosted store. The resulting URL
-   * opens in the SYSTEM BROWSER (mirrors Swift `openUpgrade(forPlan:)` /
-   * `NSWorkspace.open`). Mirrors Swift — never opens an in-app window.
+   * checkout, a user with no subscription to the hosted store, and a subscriber
+   * whose plan changes are switched off to the portal, which explains it. The
+   * URL opens in the SDK's own portal window (#606), so the store's hand-back
+   * (purchase, plan switch, expired link) closes it and the app sees the new plan
+   * — a system browser never reports back. Resolves when the window closes.
    *
+   * @param parentWindow  Pass your main window to present modally.
    * @throws OneloError('not_authenticated') when signed out (401) or
    *   `OneloError('server_error')` on `plan_not_purchasable` (404) /
    *   `callback_scheme_required` (400) / any other non-200.
    */
-  async openUpgrade(plan: string, lang = 'en'): Promise<void> {
+  async openUpgrade(plan: string, lang = 'en', parentWindow?: import('electron').BrowserWindow): Promise<void> {
     const session = await this.auth.getSession()
     if (!session) throw OneloError.notAuthenticated()
 
@@ -147,8 +161,13 @@ export class OneloStore {
       // in_app_store_not_allowed (409).
       throw OneloError.server(`Failed to initiate upgrade: HTTP ${status}${code ? ` (${code})` : ''}`)
     }
+    this.auth.brand.adopt(json) // #681: upgrade-initiate carries brand_tokens
     const upgradeUrl = (json as Record<string, unknown>)['upgrade_url'] as string | undefined
     if (!upgradeUrl) throw OneloError.server('Invalid upgrade-initiate response: missing upgrade_url')
+    if (this.presentUpgrade) {
+      await this.presentUpgrade(upgradeUrl, parentWindow)
+      return
+    }
     const { shell } = await import('electron')
     await shell.openExternal(upgradeUrl)
   }

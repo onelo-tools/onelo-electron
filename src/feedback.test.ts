@@ -4,8 +4,12 @@ import {
   POSTMESSAGE_RELAY_SCRIPT,
   FEEDBACK_CLOSE_SENTINEL,
   FEEDBACK_SUBMITTED_SENTINEL,
+  FEEDBACK_RENEW_SENTINEL,
+  feedbackRenewRequestId,
 } from './feedback'
 import { OneloFeatures } from './features'
+
+import { BrowserWindow } from 'electron'
 
 vi.mock('electron', () => ({
   BrowserWindow: vi.fn().mockImplementation(() => ({
@@ -104,5 +108,78 @@ describe('OneloFeedback', () => {
       // no-silent-swallow: the actual error is shown, and escaped.
       expect(html).toContain('boom &amp; &lt;bad&gt;')
     })
+  })
+})
+
+/**
+ * #622 — the hosted form's reporter token `ft` lives 30 minutes. A form left
+ * open longer posts `onelo:renew_request` (kind `feedback`) to itself on submit;
+ * the relay turns it into the renew sentinel, and the window re-initiates the
+ * same options and answers into the page as a self-post.
+ */
+describe('OneloFeedback — renews an expired ft (#622)', () => {
+  const HOSTED = 'https://onelo.tools/feedback/hosted?key=pk_test_123&ft=old'
+  const FRESH = 'https://onelo.tools/feedback/hosted?key=pk_test_123&ft=fresh'
+
+  it('the relay forwards only a feedback renew request posted by the page itself', () => {
+    expect(POSTMESSAGE_RELAY_SCRIPT).toContain("d.kind !== 'feedback'")
+    expect(POSTMESSAGE_RELAY_SCRIPT).toContain('e.source === window')
+    expect(POSTMESSAGE_RELAY_SCRIPT).toContain(`'${FEEDBACK_RENEW_SENTINEL}?request_id='`)
+    expect(POSTMESSAGE_RELAY_SCRIPT).toContain('window.__oneloRenewPending')
+  })
+
+  it('parses the request id from the sentinel', () => {
+    expect(feedbackRenewRequestId(`${FEEDBACK_RENEW_SENTINEL}?request_id=abc-1`)).toBe('abc-1')
+    expect(feedbackRenewRequestId(`${FEEDBACK_RENEW_SENTINEL}`)).toBeNull()
+    expect(feedbackRenewRequestId('https://evil.test/?request_id=x')).toBeNull()
+  })
+
+  async function openWindow(currentUrl: string) {
+    const navHandlers: ((e: { preventDefault(): void }, url: string) => void)[] = []
+    const executeJavaScript = vi.fn().mockResolvedValue(undefined)
+    const win = {
+      show: vi.fn(), focus: vi.fn(), close: vi.fn(), on: vi.fn(),
+      isDestroyed: vi.fn().mockReturnValue(false),
+      loadURL: vi.fn().mockResolvedValue(undefined),
+      webContents: {
+        on: vi.fn((evt: string, fn: (e: { preventDefault(): void }, url: string) => void) => {
+          if (evt === 'will-navigate') navHandlers.push(fn)
+        }),
+        setWindowOpenHandler: vi.fn(),
+        executeJavaScript,
+        getURL: vi.fn().mockReturnValue(currentUrl),
+      },
+    }
+    vi.mocked(BrowserWindow).mockImplementationOnce(() => win as unknown as InstanceType<typeof BrowserWindow>)
+    const fb = new OneloFeedback(MOCK_CONFIG, makeFeatures())
+    const initiate = vi.spyOn(fb as unknown as { _initiate: (o?: unknown) => Promise<unknown> }, '_initiate')
+      .mockResolvedValueOnce({ ok: true, hostedUrl: HOSTED })
+      .mockResolvedValueOnce({ ok: true, hostedUrl: FRESH })
+    fb.open({ type: 'bug', userId: 'u-1' })
+    await vi.waitFor(() => expect(win.loadURL).toHaveBeenCalledWith(HOSTED))
+    const navigate = (url: string) => {
+      const event = { preventDefault: vi.fn() }
+      navHandlers.forEach((fn) => fn(event, url))
+      return event
+    }
+    return { win, initiate, executeJavaScript, navigate }
+  }
+
+  it('re-initiates with the same options and answers into the page', async () => {
+    const { initiate, executeJavaScript, navigate, win } = await openWindow(HOSTED)
+    const event = navigate(`${FEEDBACK_RENEW_SENTINEL}?request_id=r-1`)
+    expect(event.preventDefault).toHaveBeenCalled()
+    await vi.waitFor(() => expect(executeJavaScript).toHaveBeenCalledWith(
+      `window.postMessage(${JSON.stringify({ type: 'onelo:renewed', request_id: 'r-1', hosted_url: FRESH })}, '*');`))
+    expect(initiate).toHaveBeenLastCalledWith({ type: 'bug', userId: 'u-1' })
+    expect(win.close).not.toHaveBeenCalled()
+  })
+
+  it('a page that navigated off the hosted origin gets no answer', async () => {
+    const { initiate, executeJavaScript, navigate } = await openWindow('https://evil.test/')
+    navigate(`${FEEDBACK_RENEW_SENTINEL}?request_id=r-1`)
+    await new Promise((r) => setTimeout(r, 10))
+    expect(initiate).toHaveBeenCalledTimes(1)
+    expect(executeJavaScript).not.toHaveBeenCalledWith(expect.stringContaining('onelo:renewed'))
   })
 })

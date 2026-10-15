@@ -1,12 +1,13 @@
 /**
- * Phase 4/5 parity: secure-mode userIdHash threading, moduleToken error mapping,
+ * Phase 4/5 parity: the signed-in user's access token (Bearer) on every Features
+ * call and userIdHash never sent (#518), moduleToken error mapping,
  * ready(timeout), refresh(force) debounce, 1% live-env batch-ping sampling.
  * Uses a controllable native-https mock (status + body settable per test).
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { EventEmitter } from 'events'
 
-interface Captured { path: string; body: string }
+interface Captured { path: string; body: string; headers: Record<string, string> }
 const captured: Captured[] = []
 // Per-test response override, keyed by URL substring. Default: 200 empty snapshot.
 let responder: (path: string) => { status: number; json: unknown } = () => ({
@@ -14,8 +15,8 @@ let responder: (path: string) => { status: number; json: unknown } = () => ({
 })
 
 vi.mock('https', () => {
-  const request = (opts: { path: string }, cb: (res: EventEmitter & { statusCode: number }) => void) => {
-    const rec: Captured = { path: opts.path, body: '' }
+  const request = (opts: { path: string; headers?: Record<string, string> }, cb: (res: EventEmitter & { statusCode: number }) => void) => {
+    const rec: Captured = { path: opts.path, body: '', headers: opts.headers ?? {} }
     captured.push(rec)
     const { status, json } = responder(opts.path)
     const res = Object.assign(new EventEmitter(), { statusCode: status }) as EventEmitter & { statusCode: number }
@@ -43,34 +44,115 @@ function body(path: string): Record<string, unknown> | undefined {
   return c ? (JSON.parse(c.body) as Record<string, unknown>) : undefined
 }
 
-describe('OneloFeatures secure-mode userIdHash', () => {
+const REFUSED = { status: 401, json: { detail: { error: 'invalid_user_token' } } }
+const OK = { status: 200, json: { features: {}, config_version: 1, token: 'mod_abc' } }
+
+/** A token source whose refresh() hands out `refreshed`. */
+function tokens(current: string | null, refreshed: string | null = 'fresh') {
+  return { current: vi.fn(async () => current), refresh: vi.fn(async () => refreshed) }
+}
+const bearersTo = (path: string) =>
+  captured.filter((c) => c.path.includes(path)).map((c) => c.headers['Authorization'])
+
+/** Replies per path substring, consumed in order (the last one repeats). */
+function replies(map: Record<string, Array<{ status: number; json: unknown }>>) {
+  responder = (path) => {
+    const key = Object.keys(map).find((k) => path.includes(k))
+    const q = key ? map[key] : undefined
+    return q ? (q.length > 1 ? q.shift()! : q[0]) : OK
+  }
+}
+
+describe('OneloFeatures — signed-in user proven with the access token (#518)', () => {
   beforeEach(() => {
     captured.length = 0
-    responder = () => ({ status: 200, json: { features: {}, config_version: 1 } })
+    responder = () => OK
+  })
+  afterEach(() => { vi.restoreAllMocks() })
+
+  it('sends Authorization: Bearer on resolve, batch-ping, poll and module-token', async () => {
+    const f = new OneloFeatures('onelo_pk_test_x', 'https://api', null, undefined, { featureEnvironment: 'test', userToken: tokens('access-1') })
+    f.declare(['foo'])
+    await f._load('u1')
+    f.stopPolling()
+    await (f as unknown as { _poll: (u: string | null) => Promise<void> })._poll('u1')
+    await f.moduleToken('slug')
+    expect(bearersTo('/api/sdk/features/resolve')).toEqual(['Bearer access-1'])
+    expect(bearersTo('/api/sdk/features/batch-ping')).toEqual(['Bearer access-1'])
+    expect(bearersTo('/api/sdk/features/poll')).toEqual(['Bearer access-1'])
+    expect(bearersTo('/api/sdk/features/module-token')).toEqual(['Bearer access-1'])
   })
 
-  it('threads userIdHash into resolve + batch-ping bodies when supplied', async () => {
-    const f = new OneloFeatures('onelo_pk_test_x', 'https://api', null, undefined, { featureEnvironment: 'test' })
+  it('never sends userIdHash (body or /poll query), even when identify() passes one', async () => {
+    const f = new OneloFeatures('onelo_pk_test_x', 'https://api', null, undefined, { featureEnvironment: 'test', userToken: tokens('access-1') })
     f.declare(['foo'])
     await f._load('u1', 'HASH123')
     f.stopPolling()
-    expect(body('/api/sdk/features/resolve')?.['userIdHash']).toBe('HASH123')
-    expect(body('/api/sdk/features/batch-ping')?.['userIdHash']).toBe('HASH123')
+    await (f as unknown as { _poll: (u: string | null) => Promise<void> })._poll('u1')
+    await f.moduleToken('slug')
+    expect(body('/api/sdk/features/resolve')?.['userIdHash']).toBeUndefined()
+    expect(body('/api/sdk/features/batch-ping')?.['userIdHash']).toBeUndefined()
+    expect(body('/api/sdk/features/module-token')?.['userIdHash']).toBeUndefined()
+    expect(captured.find((c) => c.path.includes('/poll'))?.path).not.toContain('userIdHash')
   })
 
-  it('omits userIdHash when not in secure mode', async () => {
-    const f = new OneloFeatures('onelo_pk_test_x', 'https://api', null, undefined, { featureEnvironment: 'test' })
+  it('signed out: no Authorization and no userId', async () => {
+    const f = new OneloFeatures('onelo_pk_test_x', 'https://api', null, undefined, { featureEnvironment: 'test', userToken: tokens(null) })
+    f.declare(['foo'])
+    await f._load(null)
+    f.stopPolling()
+    await (f as unknown as { _poll: (u: string | null) => Promise<void> })._poll(null)
+    for (const c of captured) expect(c.headers['Authorization']).toBeUndefined()
+    expect(body('/api/sdk/features/resolve')?.['userId']).toBeUndefined()
+    expect(captured.find((c) => c.path.includes('/poll'))?.path).not.toContain('userId')
+  })
+
+  it('401 invalid_user_token → one refresh, one retry with the new token', async () => {
+    replies({ '/features/resolve': [REFUSED, OK] })
+    const source = tokens('stale')
+    const f = new OneloFeatures('onelo_pk_test_x', 'https://api', null, undefined, { userToken: source })
     await f._load('u1')
     f.stopPolling()
-    expect(body('/api/sdk/features/resolve')?.['userIdHash']).toBeUndefined()
+    expect(bearersTo('/api/sdk/features/resolve')).toEqual(['Bearer stale', 'Bearer fresh'])
+    expect(source.refresh).toHaveBeenCalledTimes(1)
   })
 
-  it('forwards userIdHash on the /poll query', async () => {
-    const f = new OneloFeatures('onelo_pk_test_x', 'https://api', null, undefined, { featureEnvironment: 'test' })
-    await f._load('u1', 'HASH123')
+  it('refused again → a signed-in resolve/poll never falls back anonymous (#735) and warns', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    replies({ '/features/resolve': [REFUSED, REFUSED, OK], '/features/poll': [REFUSED, REFUSED, OK] })
+    const f = new OneloFeatures('onelo_pk_test_x', 'https://api', null, undefined, { userToken: tokens('stale') })
+    await f._load('u1')
     f.stopPolling()
     await (f as unknown as { _poll: (u: string | null) => Promise<void> })._poll('u1')
-    expect(captured.find((c) => c.path.includes('/poll'))?.path).toContain('userIdHash=HASH123')
+    // An anonymous answer could never be applied to u1, so it is not requested.
+    expect(bearersTo('/api/sdk/features/resolve')).toEqual(['Bearer stale', 'Bearer fresh'])
+    // Same refusal episode: the one refresh is spent, so the poll does not
+    // refresh again (no refresh loop, R1-1) and does not go anonymous.
+    expect(bearersTo('/api/sdk/features/poll')).toEqual(['Bearer stale'])
+    const polls = captured.filter((c) => c.path.includes('/features/poll'))
+    expect(polls[0].path).toContain('userId=u1')
+    expect(warn.mock.calls.some((c) => String(c[0]).includes('invalid_user_token'))).toBe(true)
+  })
+
+  it('batch-ping: refused twice → retried once, then sent without token or userId', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+    replies({ '/batch-ping': [REFUSED, REFUSED, OK] })
+    const f = new OneloFeatures('onelo_pk_test_x', 'https://api', null, undefined, { featureEnvironment: 'test', userToken: tokens('stale') })
+    f.declare(['foo'])
+    await f._load('u1')
+    f.stopPolling()
+    expect(bearersTo('/api/sdk/features/batch-ping')).toEqual(['Bearer stale', 'Bearer fresh', undefined])
+    const pings = captured.filter((c) => c.path.includes('/batch-ping'))
+    expect(JSON.parse(pings[2].body)['userId']).toBeUndefined()
+  })
+
+  it('module-token: refused twice → notAuthenticated, never minted anonymously', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+    replies({ '/module-token': [REFUSED] })
+    const f = new OneloFeatures('onelo_pk_test_x', 'https://api', null, undefined, { userToken: tokens('stale') })
+    await f._load('u1'); f.stopPolling()
+    await expect(f.moduleToken('slug')).rejects.toMatchObject({ code: 'notAuthenticated' })
+    expect(bearersTo('/api/sdk/features/module-token')).toEqual(['Bearer stale', 'Bearer fresh'])
   })
 })
 

@@ -11,20 +11,26 @@ vi.mock('@onelo/core', async () => {
 
 import { OneloStore } from './store'
 import { httpGet } from '@onelo/core'
+import { BrandSource } from '@onelo/core'
 
 const SESSION = {
   accessToken: 'tok', refreshToken: 'r', expiresAt: 9e9,
   user: { id: 'u1', email: 'a@b.com', role: 'member', tenantId: null, entitlement: 'active' },
 }
 
-function makeStore(session: unknown) {
+function makeStore(session: unknown, withPresenter = false) {
   const auth = {
+    brand: new BrandSource(),
     getSession: vi.fn(async () => session),
     presentHostedUrl: vi.fn(async () => session), // returns the signed-in session
   }
+  const presentUpgrade = vi.fn(async () => {})
   // Scheme 'MyApp' → lowercased.
-  const store = new OneloStore('https://api.example.com', 'onelo_pk_test', auth as any, 'MyApp')
-  return { store, auth }
+  const store = new OneloStore(
+    'https://api.example.com', 'onelo_pk_test', auth as any, 'MyApp', undefined,
+    withPresenter ? presentUpgrade : undefined,
+  )
+  return { store, auth, presentUpgrade }
 }
 
 describe('OneloStore.initiateStoreFlow()', () => {
@@ -77,8 +83,19 @@ describe('OneloStore.open() / openInBrowser()', () => {
     ;(httpGet as any).mockResolvedValue({ status: 200, json: { store_url: 'https://onelo.tools/store/x' } })
     const parent = { id: 'win' } as any
     const result = await store.open(parent)
-    expect(auth.presentHostedUrl).toHaveBeenCalledWith('https://onelo.tools/store/x', parent, 'Store')
+    expect(auth.presentHostedUrl).toHaveBeenCalledWith('https://onelo.tools/store/x', parent, 'Store', expect.any(Function))
     expect(result).toBe(SESSION)
+  })
+
+  it('#619 a dead store link is renewed through store-initiate', async () => {
+    const { store, auth } = makeStore(SESSION)
+    ;(httpGet as any)
+      .mockResolvedValueOnce({ status: 200, json: { store_url: 'https://onelo.tools/store/x' } })
+      .mockResolvedValueOnce({ status: 200, json: { store_url: 'https://onelo.tools/store/y' } })
+    await store.open()
+    const renew = (auth.presentHostedUrl as any).mock.calls[0][3] as () => Promise<string>
+    await expect(renew()).resolves.toBe('https://onelo.tools/store/y')
+    expect(String((httpGet as any).mock.calls[1][0])).toContain('/api/sdk/paywall/store-initiate')
   })
 
   it('openInBrowser() opens the store_url in the system browser', async () => {
@@ -98,7 +115,16 @@ describe('OneloStore.openUpgrade()', () => {
     expect(httpGet).not.toHaveBeenCalled()
   })
 
-  it('sends plan + bearer and opens the upgrade_url in the system browser', async () => {
+  it("opens the upgrade_url in the SDK's portal window, not the system browser (#606)", async () => {
+    const { store, presentUpgrade } = makeStore(SESSION, true)
+    ;(httpGet as any).mockResolvedValue({ status: 200, json: { upgrade_url: 'https://onelo.tools/store/hosted?token=srt_1', target: 'store_switch' } })
+    const parent = { id: 'win' } as any
+    await store.openUpgrade('pro', 'en', parent)
+    expect(presentUpgrade).toHaveBeenCalledWith('https://onelo.tools/store/hosted?token=srt_1', parent)
+    expect(openExternal).not.toHaveBeenCalled()
+  })
+
+  it('a standalone store with no presenter falls back to the system browser', async () => {
     const { store } = makeStore(SESSION)
     ;(httpGet as any).mockResolvedValue({ status: 200, json: { upgrade_url: 'https://onelo.tools/upgrade/x', target: 'store_switch' } })
     await store.openUpgrade('pro')

@@ -125,4 +125,20 @@ describe('OneloEventStream (Electron SSE parser)', () => {
     expect(headers['Accept']).toBe('text/event-stream')
     stream.destroy()
   })
+
+  // ADR-0003: the Event Stream's credential is a request header for every SDK
+  // but browser JS. A key in the query string lands in the reverse proxy's
+  // access.log on every connect, so it must not appear in the URL at all.
+  it('sends the key as the X-Publishable-Key header, never in the stream URL', async () => {
+    const f = vi.spyOn(globalThis, 'fetch').mockResolvedValue(streamResponse([]))
+    const stream = new OneloEventStream('https://api.example.com', 'onelo_pk_test')
+    stream.start('u1')
+    await vi.waitFor(() => { expect(f).toHaveBeenCalled() })
+    const url = f.mock.calls[0][0] as string
+    const headers = (f.mock.calls[0][1] as RequestInit).headers as Record<string, string>
+    expect(headers['X-Publishable-Key']).toBe('onelo_pk_test')
+    expect(url).not.toContain('key=')
+    expect(url).not.toContain('onelo_pk_test')
+    stream.destroy()
+  })
 })

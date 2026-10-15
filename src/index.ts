@@ -10,6 +10,7 @@ export { SecureTokenStorage } from './storage'
 export { OneloForms } from './forms'
 export { OneloWaitlist } from './waitlist'
 export { OneloElectronCustomerPortal } from './customer-portal'
+export type { PortalIntent } from './customer-portal'
 export { OneloConsent } from './consent'
 export type { OneloConsentRequirement, OneloConsentEnforcement } from './consent'
 export { OneloStore } from './store'
@@ -24,6 +25,7 @@ export { IPC_CHANNELS, OneloError } from './types'
 // let devs render a reason survey around the hosted portal in the meantime.
 export { RESPONSE_REASON_CODES, REASON_LABELS } from '@onelo/core'
 export type { ResponseReasonCode } from '@onelo/core'
+export type { SignUpOptions, SignupMarketingConsent, WaitlistConsent, WaitlistJoinOptions } from '@onelo/core'
 export type {
   OneloElectronConfig,
   OneloElectronSession,
@@ -31,3 +33,5 @@ export type {
   ResolvedSDKConfig,
   UserRole,
 } from './types'
+// #681: the brand tokens every piece of SDK chrome is painted from.
+export type { BrandTokens } from '@onelo/core'

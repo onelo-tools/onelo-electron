@@ -4,7 +4,7 @@ import { version as SDK_VERSION } from '../package.json'
 
 /**
  * Returns common security headers to include in every SDK HTTP request.
- * - X-SDK-Version: always sent
+ * - X-SDK-Version + X-Onelo-Sdk-Name: always sent, not overridable (#122)
  * - X-Bundle-Id: sent when bundleId is configured (required by backend validate_sdk_request_security)
  * - X-Codesign-Fingerprint: sent when available (macOS/Electron codesign validation)
  */
@@ -19,7 +19,6 @@ export function sdkHeaders(
   const fp = getCachedCodesignFingerprint()
   const codesignOS = fp ? getCodesignOS() : null
   return {
-    'X-SDK-Version': SDK_VERSION,
     // Platform attribution for feature discovery. Without this, rows registered
     // via POST /api/sdk/features/batch-ping stored sdk_platform=NULL (Node fetch
     // sends no SDK User-Agent, so the backend's UA fallback found nothing).
@@ -54,5 +53,13 @@ export function sdkHeaders(
     ...(fp ? { 'X-Codesign-Fingerprint': fp } : {}),
     ...(codesignOS ? { 'X-Codesign-Platform': codesignOS } : {}),
     ...extraHeaders,
+    // WHICH SDK, by registry key (#122). The dashboard compares X-SDK-Version
+    // against LATEST_SDK_VERSIONS[this]; it used to guess the SDK from
+    // app_type. Distinct from X-Onelo-Sdk-Platform above, which is the
+    // feature-discovery LANGUAGE tag and says 'js' for this SDK too. Both
+    // halves of the identity sit after the extras: a caller may add headers,
+    // never re-label the SDK or its version — the two are captured together.
+    'X-SDK-Version': SDK_VERSION,
+    'X-Onelo-Sdk-Name': 'onelo-electron',
   }
 }

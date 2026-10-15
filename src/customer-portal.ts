@@ -2,38 +2,118 @@ import { httpGet } from '@onelo/core'
 import { OneloError } from './types'
 import { sdkHeaders } from './sdk-headers'
 import type { OneloElectronAuth } from './auth'
+import { classifyHandBack } from './hand-back'
+import { portalSkeletonHtml } from './brand-chrome'
+import type { PlanChange } from './plan-change'
 
-// Pre-connect loading skeleton, shown in the portal window until the hosted page
-// paints (previously a blank white window flashed during the load). Loaded as a
-// data: URL first, then swapped to the hosted URL — the WebContents keeps painting
-// the skeleton until the real page commits. Layout mirrors the hosted PortalSkeleton
-// (frontend/app/customer/portal/PortalSkeleton.tsx) 1:1 — the same shape used by
-// every SDK — so the cross-fade has zero layout shift. No branding bg is plumbed to
-// the portal window, so #111111 (matching the window backgroundColor) is used.
-const SKELETON_HTML = `<!DOCTYPE html><html><head>
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{background:#111111;font-family:-apple-system,sans-serif;overflow:hidden}
-@keyframes onelo-shimmer{0%{background-position:-60vw 0}100%{background-position:100vw 0}}
-.wrap{display:flex;flex-direction:column;align-items:center;width:100%;padding:48px 24px 0}
-.col{width:100%;max-width:432px;display:flex;flex-direction:column;gap:14px}
-.sk{background-color:rgba(255,255,255,0.04);background-image:linear-gradient(90deg,rgba(255,255,255,0) 0%,rgba(255,255,255,0.12) 50%,rgba(255,255,255,0) 100%);background-size:60vw 100%;background-repeat:no-repeat;background-attachment:fixed;animation:onelo-shimmer 2.4s linear infinite;border-radius:8px}
-.strong{background-color:rgba(255,255,255,0.08);background-image:linear-gradient(90deg,rgba(255,255,255,0) 0%,rgba(255,255,255,0.18) 50%,rgba(255,255,255,0) 100%);background-size:60vw 100%;background-repeat:no-repeat;background-attachment:fixed;animation:onelo-shimmer 2.4s linear infinite;border-radius:9px}
-.icon{width:64px;height:64px;border-radius:14px;margin-bottom:14px;background:rgba(255,255,255,0.06);border:1.5px solid rgba(255,255,255,0.1)}
-.title{width:200px;height:22px;margin-bottom:10px;border-radius:6px}
-.sub{width:80px;height:13px;opacity:0.7;margin-bottom:32px;border-radius:4px}
-.c1{height:240px;border-radius:14px}
-.c2{height:80px;border-radius:14px}
-.c3{height:140px;border-radius:14px}
-</style></head><body>
-<div class="wrap">
-<div class="sk icon"></div>
-<div class="sk title"></div>
-<div class="sk sub"></div>
-<div class="col"><div class="strong c1"></div><div class="strong c2"></div><div class="strong c3"></div></div>
-</div>
-</body></html>`
+// Pre-connect loading skeleton (brand-chrome.ts `portalSkeletonHtml`), shown in
+// the portal window until the hosted page paints. Loaded as a data: URL first,
+// then swapped to the hosted URL — the WebContents keeps painting the skeleton
+// until the real page commits. #681: painted from the brand tokens (portal-
+// initiate `brand_tokens`, else config, else neutral).
+
+/**
+ * Injected into every page the portal window loads (#613 / #614). The hosted
+ * portal (and the store it opens) asks for a fresh portal token with a
+ * `onelo:renew_request` postMessage to its own window; this relay turns it into
+ * a `<scheme>://renew-portal?request_id=…` navigation the window intercepts —
+ * the same sentinel pattern Swift uses, because a BrowserWindow without a
+ * preload has no other page→main channel. A request the page made before this
+ * script ran is parked on `window.__oneloRenewPending` and forwarded here.
+ */
+export function portalRenewRelayScript(protocol: string): string {
+  return `(function(){
+  if (window.__oneloRenewRelay) return; window.__oneloRenewRelay = true;
+  function fwd(d){
+    if (!d || d.type !== 'onelo:renew_request' || d.kind !== 'portal' || typeof d.request_id !== 'string') return;
+    window.location.href = ${JSON.stringify(`${protocol}://renew-portal?request_id=`)} + encodeURIComponent(d.request_id);
+  }
+  window.addEventListener('message', function(e){
+    if (e.source !== window) return;
+    var d = e.data;
+    if (typeof d === 'string') { try { d = JSON.parse(d) } catch (_) { return } }
+    fwd(d);
+  });
+  if (window.__oneloRenewPending) fwd(window.__oneloRenewPending);
+})();`
+}
+
+/** True when both URLs parse and share scheme, host and port. */
+export function sameOrigin(a: string, b: string): boolean {
+  try {
+    const ua = new URL(a); const ub = new URL(b)
+    return ua.origin !== 'null' && ua.origin === ub.origin
+  } catch {
+    return false
+  }
+}
+
+/** The script that delivers a renew reply into the page, as a self-post. */
+export function portalRenewReplyScript(reply: Record<string, unknown>): string {
+  return `window.postMessage(${JSON.stringify(reply)}, '*');`
+}
+
+export type PortalNavigation =
+  | { kind: 'renew_portal'; requestId: string }
+  | { kind: 'portal_done'; event: string | null }
+  | { kind: 'checkout_complete' }
+  | { kind: 'store_done'; reason: string }
+  /** `<scheme>://callback?error=…` — the store link opened in this window is
+   *  spent ("Return to app" on the expired screen). Close; nothing to exchange. */
+  | { kind: 'store_cancel'; error: string }
+
+/**
+ * Which of the SDK's own deep-links a portal-window navigation is, or `null`
+ * for everything else (hosted pages load normally). Pure, so the rule is
+ * testable without a BrowserWindow.
+ *
+ * `protocol` is compared case-insensitively on the scheme prefix only.
+ */
+export function classifyPortalNavigation(url: string, protocol: string): PortalNavigation | null {
+  const prefix = `${protocol}://`
+  if (url.slice(0, prefix.length).toLowerCase() !== prefix.toLowerCase()) return null
+  let parsed: URL
+  try {
+    parsed = new URL(url)
+  } catch {
+    return null
+  }
+  if (parsed.host === 'renew-portal') {
+    const requestId = parsed.searchParams.get('request_id')
+    return requestId ? { kind: 'renew_portal', requestId } : null
+  }
+  // Everything else is the one Store Hand-back decoder (#615): the portal's
+  // Done, a purchase started from the portal (#592) or a plan switch with no
+  // checkout (#599).
+  const hb = classifyHandBack(url, protocol)
+  if (!hb) return null
+  switch (hb.kind) {
+    case 'portal_closed': return { kind: 'portal_done', event: hb.event }
+    case 'purchase': return { kind: 'checkout_complete' }
+    case 'switched': return { kind: 'store_done', reason: hb.reason }
+    case 'error': return { kind: 'store_cancel', error: hb.error }
+  }
+}
+
+/** Where a portal opens. `'change_plan'` lands straight in the plan picker —
+ *  the hosted portal asks the backend where the upgrade goes (#587). */
+export type PortalIntent = 'change_plan'
+
+/**
+ * The hosted portal URL with `intent` as a query param (#606) — the same
+ * param `@onelo/js` `customerPortal.open({ intent })` sets. No intent → the URL
+ * unchanged.
+ */
+export function withPortalIntent(hostedUrl: string, intent?: PortalIntent): string {
+  if (!intent) return hostedUrl
+  try {
+    const u = new URL(hostedUrl)
+    u.searchParams.set('intent', intent)
+    return u.toString()
+  } catch {
+    return hostedUrl
+  }
+}
 
 /**
  * Opens the Onelo hosted customer portal in a standalone BrowserWindow.
@@ -49,6 +129,13 @@ body{background:#111111;font-family:-apple-system,sans-serif;overflow:hidden}
  *   await onelo.customerPortal.open(mainWindow)
  */
 export class OneloElectronCustomerPortal {
+  /** Told when the store opened in the portal window ended in a purchase or a
+   *  plan switch (#659). Set by `Onelo` to its plan-change refresher. */
+  private onPlanChange: ((change: PlanChange) => void) | null = null
+  setPlanChangeHandler(fn: ((change: PlanChange) => void) | null): void {
+    this.onPlanChange = fn
+  }
+
   private readonly apiUrl: string
   private readonly publishableKey: string
   private readonly auth: OneloElectronAuth
@@ -103,9 +190,26 @@ export class OneloElectronCustomerPortal {
     if (status !== 200) throw OneloError.server(`Failed to initiate customer portal: HTTP ${status}`)
 
     const j = json as Record<string, unknown>
+    this.auth.brand.adopt(j)
     const hostedUrl = j['hosted_url'] as string | undefined
     if (!hostedUrl) throw OneloError.server('Invalid portal-initiate response: missing hosted_url')
     return hostedUrl
+  }
+
+  /**
+   * Answer the hosted portal's `onelo:renew_request` (#613 / #614): mint a fresh
+   * portal with the signed-in user's own session. Signed out or refused →
+   * `renew_failed` with `not_authenticated`, and the page shows its branded
+   * "signed out" screen. Never throws.
+   */
+  async renewReply(requestId: string): Promise<Record<string, unknown>> {
+    try {
+      const hostedUrl = await this.initiate()
+      return { type: 'onelo:renewed', request_id: requestId, hosted_url: hostedUrl }
+    } catch (e) {
+      const reason = e instanceof OneloError && e.code === 'not_authenticated' ? 'not_authenticated' : 'renew_failed'
+      return { type: 'onelo:renew_failed', request_id: requestId, reason }
+    }
   }
 
   /**
@@ -113,11 +217,28 @@ export class OneloElectronCustomerPortal {
    * Throws `OneloError` (`not_authenticated`) when no session is active.
    *
    * @param parentWindow  Optional parent BrowserWindow (for modal centering).
+   * @param opts.intent   `'change_plan'` opens the portal straight into the plan
+   *   picker (parity with `@onelo/js` `customerPortal.open({ intent })`). The
+   *   hosted portal asks the backend where the change goes — a plan switch, the
+   *   store for a user without a paid plan, or an explanation when plan changes
+   *   are off.
    * @returns             Resolves when the portal window is closed.
    */
-  async open(parentWindow?: import('electron').BrowserWindow): Promise<void> {
+  async open(parentWindow?: import('electron').BrowserWindow, opts?: { intent?: PortalIntent }): Promise<void> {
     const hostedUrl = await this.initiate()
-    return this._presentPortalWindow(hostedUrl, parentWindow)
+    return this.presentUrl(withPortalIntent(hostedUrl, opts?.intent), parentWindow)
+  }
+
+  /**
+   * Present an already-minted hosted URL (portal, or a store / plan-switch URL
+   * from `/upgrade-initiate`) in the portal window. Handles every hand-back the
+   * portal does, then re-reads the entitlement so `hasActiveAccess` reflects a
+   * plan bought or changed in the window. Resolves when the window closes.
+   * @internal Used by `OneloStore.openUpgrade`.
+   */
+  async presentUrl(url: string, parentWindow?: import('electron').BrowserWindow): Promise<void> {
+    await this._presentPortalWindow(url, parentWindow)
+    await this.auth.revalidateEntitlement().catch(() => { /* best-effort */ })
   }
 
   /**
@@ -132,10 +253,10 @@ export class OneloElectronCustomerPortal {
    * `second-instance` (win/linux) handler to call `handlePortalCallback(url)` so
    * those events clear the local session.
    */
-  async openInBrowser(): Promise<void> {
+  async openInBrowser(opts?: { intent?: PortalIntent }): Promise<void> {
     const hostedUrl = await this.initiate()
     const { shell } = await import('electron')
-    await shell.openExternal(hostedUrl)
+    await shell.openExternal(withPortalIntent(hostedUrl, opts?.intent))
   }
 
   /**
@@ -196,9 +317,9 @@ export class OneloElectronCustomerPortal {
             resizable: true,
             minimizable: false,
             maximizable: false,
-            // Dark ground so the window never flashes white before the skeleton /
-            // hosted page paints (matches the skeleton + hosted portal background).
-            backgroundColor: '#111111',
+            // Brand page_bg so the window never flashes white before the skeleton /
+            // hosted page paints (#681; matches the skeleton + hosted portal).
+            backgroundColor: this.auth.brand.current().page_bg,
             webPreferences: { nodeIntegration: false, contextIsolation: true },
             title: 'Manage Account',
           })
@@ -210,7 +331,7 @@ export class OneloElectronCustomerPortal {
           // will-navigate does not fire for programmatic loadURL, and handleNav only
           // acts on `${protocol}://` URLs, so the data: load can't trip the deep-link
           // interceptor. A failure in either load closes the window → 'closed' resolves.
-          win.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(SKELETON_HTML)}`)
+          win.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(portalSkeletonHtml(this.auth.brand.current()))}`)
             .then(() => { if (!win.isDestroyed()) return win.loadURL(hostedUrl) })
             .catch(() => {
               // loadURL threw (e.g. invalid URL scheme). The did-fail-load handler
@@ -238,22 +359,30 @@ export class OneloElectronCustomerPortal {
           // local session is still being cleared.
           let pendingSignOut: Promise<void> | null = null
 
-          // Intercept the portal-done deep-link: <scheme>://callback?source=portal
-          // Optionally carries &event=account_deletion_scheduled.
-          const handleNav = (_event: Electron.Event, url: string): void => {
-            // Compare only the scheme prefix case-insensitively; keep the
-            // original url intact for URL parsing below.
-            const prefix = `${this.protocol}://`
-            if (url.slice(0, prefix.length).toLowerCase() !== prefix) return
+          // Intercept the portal's deep-links (see classifyPortalNavigation):
+          //   <scheme>://callback?source=portal[&event=…] — portal Done / hard event
+          //   <scheme>://callback?code=…                   — a store purchase started
+          //     from the portal finished (#592). The window just closes: the buyer
+          //     is already signed in, and the plan is reconciled at once (#659).
+          //     Blocked so the scheme URL never reaches the OS (second instance).
+          const handleNav = (event: Electron.Event, url: string): void => {
+            const nav = classifyPortalNavigation(url, this.protocol)
+            if (!nav) return
 
-            let parsed: URL
-            try {
-              parsed = new URL(url)
-            } catch {
+            // #614 — the page asks for a fresh portal token. Not a close: block
+            // the sentinel, answer into the page, keep listening.
+            if (nav.kind === 'renew_portal') {
+              event.preventDefault()
+              // A fresh portal is a bearer credential: answer only a page still
+              // on the portal's own origin, never one the window navigated to.
+              if (!sameOrigin(win.webContents.getURL(), hostedUrl)) return
+              void this.renewReply(nav.requestId).then((reply) => {
+                if (!win.isDestroyed()) {
+                  win.webContents.executeJavaScript(portalRenewReplyScript(reply)).catch(() => { /* page gone */ })
+                }
+              })
               return
             }
-
-            if (parsed.searchParams.get('source') !== 'portal') return
 
             win.webContents.removeListener('will-redirect', handleNav)
             win.webContents.removeListener('will-navigate', handleNav)
@@ -261,17 +390,38 @@ export class OneloElectronCustomerPortal {
             const closeAndResolve = (): void => {
               if (!win.isDestroyed()) win.close()
             }
+
+            //   <scheme>://callback?source=store&event=… — a plan switch with no
+            //     checkout finished (#599). Same close: nothing to exchange.
+            //   <scheme>://callback?error=… — the store link is spent and the
+            //     buyer tapped "Return to app". Same close.
+            if (nav.kind === 'checkout_complete' || nav.kind === 'store_done' || nav.kind === 'store_cancel') {
+              event.preventDefault()
+              // A purchase or a switch moved the plan: reconcile now (#659),
+              // not whenever the stream catches up.
+              if (nav.kind === 'checkout_complete') this.onPlanChange?.({ kind: 'purchase' })
+              else if (nav.kind === 'store_done') this.onPlanChange?.({ kind: 'switched', reason: nav.reason })
+              closeAndResolve()
+              return
+            }
             // Hard events (deletion / revoke / compromise) clear the local
             // session before closing; other/absent events just close. Track the
             // promise so the 'closed' handler awaits it (the user could close the
             // window manually before signOut settles). _applyPortalEvent is a
             // no-op for non-revoke events → resolves immediately.
-            pendingSignOut = this._applyPortalEvent(parsed.searchParams.get('event'))
+            pendingSignOut = this._applyPortalEvent(nav.event)
             pendingSignOut.finally(closeAndResolve)
           }
 
           win.webContents.on('will-redirect', handleNav)
           win.webContents.on('will-navigate', handleNav)
+          // Every page the window loads (portal, then the store it opens) gets
+          // the renew relay (#614).
+          const installRenewRelay = (): void => {
+            if (win.isDestroyed()) return
+            win.webContents.executeJavaScript(portalRenewRelayScript(this.protocol)).catch(() => { /* data: skeleton or page gone */ })
+          }
+          win.webContents.on('dom-ready', installRenewRelay)
 
           win.on('closed', () => {
             // At 'closed' the webContents is already destroyed — its nav

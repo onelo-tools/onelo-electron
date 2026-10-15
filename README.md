@@ -73,13 +73,15 @@ Two rules worth calling out, because getting them wrong is the usual source of t
 - **Pass `null` to `presentAuthWindow`**, not your main window, so auth appears as a standalone window.
 - **Create the main window with `show: false`** and call `mainWindow.show()` only after sign-in.
 
+A magic link from the hosted sign-in can be opened on another device: it shows a code there, and the sign-in window completes once the code is typed. Opened on this computer, it returns through your protocol handler. On Windows and Linux, pass a deep link from `process.argv` or `second-instance` to `handleDeepLink` before you call `presentAuthWindow`, because a new sign-in replaces the verifier that link needs.
+
 ## Modules
 
 Everything below hangs off the one `onelo` instance.
 
 | Accessor | What it does | Key methods |
 |---|---|---|
-| `onelo.auth` | Hosted sign-in, sessions, magic links, deep links | `presentAuthWindow()`, `isAllowedIn()`, `onSessionChange()`, `handleDeepLink()`, `sendMagicLink()`, `signOut()` |
+| `onelo.auth` | Hosted sign-in, sessions, magic links, deep links | `presentAuthWindow()`, `isAllowedIn()`, `onSessionChange()`, `handleDeepLink()`, `sendMagicLink()`, `resendVerificationEmail()`, `confirmEmail()`, `getSignupMarketingConsent()`, `signOut()` |
 | `onelo.features` | Plan-gated feature flags, pushed live | `feature()`, `isEnabled()`, `subscribe()`, `refresh()` |
 | `onelo.monitor` | Error and event reporting | `capture()`, `event()`, `breadcrumb()`, `flush()` |
 | `onelo.store` | Your hosted store, on your own Stripe | `open()`, `openUpgrade()`, `openInBrowser()` |
@@ -89,7 +91,19 @@ Everything below hangs off the one `onelo` instance.
 | `onelo.waitlist` | Pre-launch signups | `join()` |
 | `onelo.consent` | Versioned terms / privacy consent gate | `presentGateIfNeeded()`, `requiredConsents()`, `acceptConsent()` |
 
-Top-level helpers: `identify(userId, userIdHash?)`, `openUpgrade(plan, lang?)`, `clearIdentity()`, `destroy()`.
+Top-level helpers: `openUpgrade(plan, lang?)`, `destroy()`. Onelo requires Onelo Auth: signing in sets the user for every module, so the app does not call `identify()`.
+
+`identify()` and its `userIdHash` argument are deprecated: the signed-in Onelo user is used automatically, and Features calls prove that user with their access token.
+
+## Showing gated UI at startup
+
+Wait for the current user's feature snapshot before you show gated UI. `getSession()` restores the stored user; `features.ready()` resolves once that user's snapshot is confirmed, or after the timeout (the snapshot saved on disk stays in use, and `subscribe()` fires when confirmation arrives). Await `ready()` again after every sign-in, sign-out or user switch.
+
+```ts
+await onelo.auth.getSession()
+await onelo.features.ready(1500)
+createMainWindow() // gated UI now reads the current user's features
+```
 
 ## Talking to the renderer
 

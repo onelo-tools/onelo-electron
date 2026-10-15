@@ -11,7 +11,11 @@ function fakeStream() {
   const handlers: Record<string, (d: Record<string, unknown>) => void> = {}
   const providers: Array<() => Record<string, string>> = []
   let fallback: (() => void) | undefined
+  let identity: ((i: { userId: string | null; anonymousFallback: boolean } | null) => void) | undefined
   return {
+    onConnectionIdentity: (fn: typeof identity) => { identity = fn },
+    /** Simulate the socket authenticating `userId` (#735: frames count only then). */
+    connect: (userId: string | null) => identity?.({ userId, anonymousFallback: false }),
     on: (e: string, h: (d: Record<string, unknown>) => void) => { handlers[e] = h },
     emit: (e: string, d: Record<string, unknown>) => handlers[e]?.(d),
     addParamProvider: (fn: () => Record<string, string>) => providers.push(fn),
@@ -28,7 +32,7 @@ describe('OneloFeatures — SSE snapshot + forward-compat', () => {
 
   it('applies a features_updated snapshot and fails CLOSED on an unknown status', () => {
     f = new OneloFeatures('pk', 'https://api.example.com', null)
-    const s = fakeStream(); f.attachEventStream(s as any)
+    const s = fakeStream(); f.attachEventStream(s as any); void f._load(null); s.connect(null)
     s.emit('features_updated', {
       config_version: 5,
       features: { a: { status: 'enabled' }, b: { status: 'quantum-teleport' } },
@@ -41,7 +45,7 @@ describe('OneloFeatures — SSE snapshot + forward-compat', () => {
 
   it('exposes reason / requiredPlan / upgradeCTA and normalizes an unknown reason', () => {
     f = new OneloFeatures('pk', 'https://api.example.com', null)
-    const s = fakeStream(); f.attachEventStream(s as any)
+    const s = fakeStream(); f.attachEventStream(s as any); void f._load(null); s.connect(null)
     s.emit('connected', {
       config_version: 6,
       features: {
@@ -63,7 +67,7 @@ describe('OneloFeatures — SSE snapshot + forward-compat', () => {
 
   it('since_version param provider reflects the latest applied config_version', () => {
     f = new OneloFeatures('pk', 'https://api.example.com', null)
-    const s = fakeStream(); f.attachEventStream(s as any)
+    const s = fakeStream(); f.attachEventStream(s as any); void f._load(null); s.connect(null)
     expect(s.params().since_version).toBe('0')
     s.emit('features_updated', { config_version: 12, features: {} })
     expect(s.params().since_version).toBe('12')
@@ -74,7 +78,7 @@ describe('OneloFeatures — SSE snapshot + forward-compat', () => {
   it('feeds the flag value to monitor.recordFlag on feature()', () => {
     const monitor = { _trackFeatureCall: vi.fn(), recordFlag: vi.fn() }
     f = new OneloFeatures('pk', 'https://api.example.com', monitor)
-    const s = fakeStream(); f.attachEventStream(s as any)
+    const s = fakeStream(); f.attachEventStream(s as any); void f._load(null); s.connect(null)
     s.emit('features_updated', { config_version: 1, features: { a: { status: 'enabled' } } })
     f.feature('a')
     expect(monitor.recordFlag).toHaveBeenCalledWith('a', 'enabled')
@@ -82,7 +86,7 @@ describe('OneloFeatures — SSE snapshot + forward-compat', () => {
 
   it('invalidateCache reconnects the stream (so the server resends a full snapshot)', () => {
     f = new OneloFeatures('pk', 'https://api.example.com', null)
-    const s = fakeStream(); f.attachEventStream(s as any)
+    const s = fakeStream(); f.attachEventStream(s as any); void f._load(null); s.connect(null)
     ;(f as any).streamActive = true
     f.invalidateCache()
     expect(s.reconnect).toHaveBeenCalled()
@@ -91,7 +95,7 @@ describe('OneloFeatures — SSE snapshot + forward-compat', () => {
 
   it('a 429 cap (onFallback) starts the poll fallback', () => {
     f = new OneloFeatures('pk', 'https://api.example.com', null)
-    const s = fakeStream(); f.attachEventStream(s as any)
+    const s = fakeStream(); f.attachEventStream(s as any); void f._load(null); s.connect(null)
     const pollSpy = vi.spyOn(f as any, '_startPolling')
     s.triggerFallback()
     expect(pollSpy).toHaveBeenCalled()

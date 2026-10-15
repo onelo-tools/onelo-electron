@@ -1,5 +1,6 @@
 import os from 'os'
 import { scrubText, scrubMeta } from './scrubber'
+import { classifyErrorOrigin, type ErrorOrigin } from '@onelo/core'
 import { version as SDK_VERSION } from '../package.json'
 
 export interface MonitorEventOptions {
@@ -166,7 +167,7 @@ function _installGlobalHandlers(): void {
   // never silently change.
   proc.on('uncaughtExceptionMonitor', (err: unknown) => {
     const { message, stack } = _extractError(err)
-    _activeMonitor?._onGlobalError(message, stack)
+    _activeMonitor?._onGlobalError(message, stack, classifyErrorOrigin(err))
   })
 }
 
@@ -515,7 +516,9 @@ export class OneloMonitor {
    * Internal: routed here by the module-level crash handlers. Only the current
    * active monitor receives these. `_push` already flushes on a `global_error`.
    */
-  _onGlobalError(message: string, stack?: string): void {
-    this._push('unhandled', false, undefined, message, this._withError(undefined, stack), 'global_error')
+  _onGlobalError(message: string, stack?: string, origin: ErrorOrigin = 'app'): void {
+    // meta.origin: whose error this is (#548). The backend keeps the SDK's own
+    // errors out of the developer's Monitor data — see classifyErrorOrigin.
+    this._push('unhandled', false, undefined, message, { ...this._withError(undefined, stack), origin }, 'global_error')
   }
 }

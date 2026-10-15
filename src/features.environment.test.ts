@@ -12,6 +12,7 @@ import { EventEmitter } from 'events'
 
 interface CapturedRequest {
   path: string
+  headers: Record<string, string>
   body: string
 }
 
@@ -19,10 +20,10 @@ const captured: CapturedRequest[] = []
 
 vi.mock('https', () => {
   const request = (
-    opts: { path: string },
+    opts: { path: string; headers?: Record<string, string> },
     cb: (res: EventEmitter & { statusCode: number }) => void,
   ) => {
-    const rec: CapturedRequest = { path: opts.path, body: '' }
+    const rec: CapturedRequest = { path: opts.path, headers: opts.headers ?? {}, body: '' }
     captured.push(rec)
     const res = Object.assign(new EventEmitter(), { statusCode: 200 }) as EventEmitter & { statusCode: number }
     // Deliver an empty-features response asynchronously so the helper resolves.
@@ -85,6 +86,7 @@ describe('OneloFeatures featureEnvironment', () => {
   it('forwards environment on /poll query when set', async () => {
     const f = new OneloFeatures('pk_live', 'https://api', null, undefined, { featureEnvironment: 'test' })
     // _poll is private; invoke directly to assert the query param.
+    await f._load('u1'); f.stopPolling()
     await (f as unknown as { _poll: (u: string | null) => Promise<void> })._poll('u1')
     const pollCall = captured.find((c) => c.path.includes('/api/sdk/features/poll'))
     expect(pollCall?.path).toContain('environment=test')
@@ -92,8 +94,20 @@ describe('OneloFeatures featureEnvironment', () => {
 
   it('omits environment on /poll query when unset', async () => {
     const f = new OneloFeatures('pk_live', 'https://api', null, undefined)
+    await f._load('u1'); f.stopPolling()
     await (f as unknown as { _poll: (u: string | null) => Promise<void> })._poll('u1')
     const pollCall = captured.find((c) => c.path.includes('/api/sdk/features/poll'))
     expect(pollCall?.path).not.toContain('environment=')
+  })
+
+  it('sends the key as X-Publishable-Key on /poll and NOT in the query string (ADR-0003, #105)', async () => {
+    const f = new OneloFeatures('pk_live', 'https://api', null, undefined)
+    await f._load('u1'); f.stopPolling()
+    await (f as unknown as { _poll: (u: string | null) => Promise<void> })._poll('u1')
+    const pollCall = captured.find((c) => c.path.includes('/api/sdk/features/poll'))
+    expect(pollCall).toBeDefined()
+    expect(pollCall!.headers['X-Publishable-Key']).toBe('pk_live')
+    expect(new URL(pollCall!.path, 'https://api').searchParams.has('key')).toBe(false)
+    expect(pollCall!.path).not.toContain('pk_live')
   })
 })

@@ -2,6 +2,9 @@ import https from 'https'
 import http from 'http'
 import type { OneloFeatures } from './features'
 import { sdkHeaders } from './sdk-headers'
+import { bearerHeader, sendWithUserToken, type UserTokenSource } from './user-token'
+import { BrandSource } from '@onelo/core'
+import { brandErrorPageHtml, feedbackSkeletonHtml } from './brand-chrome'
 
 interface FeedbackConfig {
   publishableKey: string
@@ -54,75 +57,76 @@ export const FEEDBACK_CLOSE_SENTINEL = 'onelo://feedback_close'
 // will-navigate interceptor catches it and re-runs the fetch in the same window
 // (parity with Swift's onelo://feedback_retry sentinel + FeedbackWebCoordinator).
 const FEEDBACK_RETRY_SENTINEL = 'onelo://feedback_retry'
+// #622 — the hosted form's reporter token `ft` expired and it asks for a fresh
+// one (`onelo:renew_request`, kind `feedback`, a self-post). The relay turns it
+// into this sentinel; handleNav re-initiates and answers into the page.
+export const FEEDBACK_RENEW_SENTINEL = 'onelo://feedback_renew'
 
 export const POSTMESSAGE_RELAY_SCRIPT = `
 (function () {
+  function renew(d) {
+    if (!d || d.type !== 'onelo:renew_request' || d.kind !== 'feedback' || typeof d.request_id !== 'string') return;
+    window.location.href = '${FEEDBACK_RENEW_SENTINEL}?request_id=' + encodeURIComponent(d.request_id);
+  }
   window.addEventListener('message', function (e) {
     if (e.data && e.data.type === 'onelo:feedback_submitted') {
       window.location.href = '${FEEDBACK_SUBMITTED_SENTINEL}';
     } else if (e.data && e.data.type === 'onelo:feedback_close') {
       window.location.href = '${FEEDBACK_CLOSE_SENTINEL}';
+    } else if (e.source === window) {
+      var d = e.data;
+      if (typeof d === 'string') { try { d = JSON.parse(d) } catch (_) { return } }
+      renew(d);
     }
   });
+  if (window.__oneloRenewPending) renew(window.__oneloRenewPending);
 })();
 `
 
-const SKELETON_HTML = `<!DOCTYPE html>
-<html>
-<head>
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<style>
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body {
-    background: #111;
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-    padding: 40px 36px 32px;
-    overflow: hidden;
+/** The request id of a `onelo://feedback_renew?request_id=…` sentinel, or null. */
+export function feedbackRenewRequestId(url: string): string | null {
+  if (!url.startsWith(FEEDBACK_RENEW_SENTINEL)) return null
+  try {
+    const id = new URL(url).searchParams.get('request_id')
+    return id ? id : null
+  } catch {
+    return null
   }
-  @keyframes shimmer {
-    0%   { background-position: -600px 0; }
-    100% { background-position:  600px 0; }
+}
+
+/** True when both URLs parse and share scheme, host and port. */
+function sameOrigin(a: string, b: string | null): boolean {
+  if (!b) return false
+  try {
+    const ua = new URL(a); const ub = new URL(b)
+    return ua.origin !== 'null' && ua.origin === ub.origin
+  } catch {
+    return false
   }
-  .sk {
-    border-radius: 10px;
-    background: linear-gradient(90deg, #1e1e1e 25%, #2a2a2a 50%, #1e1e1e 75%);
-    background-size: 600px 100%;
-    animation: shimmer 1.4s infinite linear;
-  }
-  .icon     { width: 64px; height: 64px; border-radius: 14px; margin: 0 auto 16px; }
-  .title    { width: 220px; height: 22px; margin: 0 auto 40px; border-radius: 6px; }
-  .cards    { display: flex; gap: 12px; margin-bottom: 32px; }
-  .card     { flex: 1; height: 76px; border-radius: 12px; }
-  .label    { width: 60px; height: 13px; border-radius: 4px; margin-bottom: 8px; }
-  .input    { width: 100%; height: 44px; border-radius: 10px; margin-bottom: 24px; }
-  .textarea { width: 100%; height: 110px; border-radius: 10px; margin-bottom: 32px; }
-  .btn      { width: 100%; height: 48px; border-radius: 12px; }
-</style>
-</head>
-<body>
-  <div class="sk icon"></div>
-  <div class="sk title"></div>
-  <div class="cards">
-    <div class="sk card"></div>
-    <div class="sk card"></div>
-    <div class="sk card"></div>
-  </div>
-  <div class="sk label"></div>
-  <div class="sk input"></div>
-  <div class="sk label"></div>
-  <div class="sk textarea"></div>
-  <div class="sk btn"></div>
-</body>
-</html>`
+}
+
 
 export class OneloFeedback {
+  /** The SDK's brand-token model (#681). `Onelo` shares the auth's one. */
+  private brand: BrandSource = new BrandSource()
+  setBrandSource(brand: BrandSource): void {
+    this.brand = brand
+  }
   private readonly config: FeedbackConfig
   private readonly features: OneloFeatures
   private window: import('electron').BrowserWindow | null = null
+  /** The hosted form URL the window was last sent to (for the renew origin check). */
+  private hostedUrl: string | null = null
 
-  constructor(config: FeedbackConfig, features: OneloFeatures) {
+  /** The signed-in Onelo user's access token (#820). Wired by `Onelo` to
+   *  `auth`; with a session the initiate call carries it and the report names
+   *  a verified reporter. Absent, the call is exactly as before. */
+  private readonly userToken?: UserTokenSource
+
+  constructor(config: FeedbackConfig, features: OneloFeatures, userToken?: UserTokenSource) {
     this.config = config
     this.features = features
+    this.userToken = userToken
   }
 
   /** No-op shim — session context is now derived from active feature flags automatically. */
@@ -159,7 +163,7 @@ export class OneloFeedback {
       minHeight: 680,
       resizable: true,
       title: 'Send Feedback',
-      backgroundColor: '#111111',
+      backgroundColor: this.brand.current().page_bg,
       webPreferences: { nodeIntegration: false, contextIsolation: true },
     })
 
@@ -190,6 +194,19 @@ export class OneloFeedback {
       } else if (url.startsWith(FEEDBACK_RETRY_SENTINEL)) {
         event.preventDefault()
         void this._loadHostedForm(options)
+      } else if (url.startsWith(FEEDBACK_RENEW_SENTINEL)) {
+        // #622 — not a close: block the sentinel, answer into the page.
+        event.preventDefault()
+        const requestId = feedbackRenewRequestId(url)
+        const win = this.window
+        if (!requestId || !win || win.isDestroyed()) return
+        // Answer only a page still on the hosted form's own origin.
+        if (!sameOrigin(win.webContents.getURL(), this.hostedUrl)) return
+        void this.renewReply(requestId, options).then((reply) => {
+          if (!win.isDestroyed()) {
+            win.webContents.executeJavaScript(`window.postMessage(${JSON.stringify(reply)}, '*');`).catch(() => { /* page gone */ })
+          }
+        })
       }
     }
     this.window.webContents.on('will-navigate', handleNav)
@@ -210,21 +227,19 @@ export class OneloFeedback {
       // the try so a window teardown mid-load can't reject this method — it's
       // invoked as `void this._loadHostedForm(...)` from the retry interceptor,
       // so an escaping rejection would be unhandled.
-      await this.window.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(SKELETON_HTML)}`)
+      await this.window.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(feedbackSkeletonHtml(this.brand.current()))}`)
       if (!this.window || this.window.isDestroyed()) return
-      const initiateUrl = this.buildInitiateUrl(options)
-      // userId as a header (X-Onelo-User-Id), not a query param → stays out of logs.
-      const headers = { ...sdkHeaders(this.config.bundleId), ...(options?.userId ? { 'X-Onelo-User-Id': options.userId } : {}) }
-      const { status, json } = await httpGet(initiateUrl, headers)
-      if (status < 200 || status >= 300) {
+      const result = await this._initiate(options)
+      if (!result.ok) {
         // Show the error in-window instead of silently closing (no-silent-
         // swallows — mirrors Swift's errorHTML). The user sees what happened.
-        await this._showError(`Couldn't load feedback (HTTP ${status}).`)
+        await this._showError(`Couldn't load feedback (HTTP ${result.status}).`)
         return
       }
-      const { hosted_url } = json as { hosted_url: string }
+      const hosted_url = result.hostedUrl
 
       if (!this.window || this.window.isDestroyed()) return
+      this.hostedUrl = hosted_url
       await this.window.loadURL(hosted_url)
       // Relay the hosted page's postMessage → the submitted sentinel that
       // handleNav (installed once in _openAsync) intercepts. Re-injected on every
@@ -235,6 +250,39 @@ export class OneloFeedback {
     }
   }
 
+  /** Mint a hosted feedback URL (and with it a fresh reporter token `ft`). */
+  private async _initiate(options?: OpenOptions): Promise<{ ok: true; hostedUrl: string } | { ok: false; status: number }> {
+    const initiateUrl = this.buildInitiateUrl(options)
+    // Signed in (#820): `Authorization: Bearer <access token>` makes the server
+    // sign the token's user as a VERIFIED reporter. A refused token is refreshed
+    // and retried once; refused again, the form still opens without it (as a
+    // signed-out call would), so feedback never fails on identity.
+    // userId as a header (X-Onelo-User-Id), not a query param → stays out of logs.
+    // Without a session it is the developer's unverified label.
+    const { status, json } = await sendWithUserToken(this.userToken, ({ token }) => httpGet(initiateUrl, {
+      ...sdkHeaders(this.config.bundleId),
+      ...bearerHeader(token),
+      ...(options?.userId ? { 'X-Onelo-User-Id': options.userId } : {}),
+    }), () => {})
+    const hostedUrl = (json as { hosted_url?: unknown } | null)?.hosted_url
+    if (status < 200 || status >= 300 || typeof hostedUrl !== 'string' || !hostedUrl) return { ok: false, status }
+    return { ok: true, hostedUrl }
+  }
+
+  /**
+   * Answer the hosted form's `onelo:renew_request` (kind `feedback`, #622). The
+   * form's reporter token `ft` lives 30 minutes; a form left open longer asks
+   * for a fresh one on submit. The same options are initiated again, so the
+   * report keeps its reporter, type, area and session.
+   */
+  async renewReply(requestId: string, options?: OpenOptions): Promise<Record<string, unknown>> {
+    try {
+      const result = await this._initiate(options)
+      if (result.ok) return { type: 'onelo:renewed', request_id: requestId, hosted_url: result.hostedUrl }
+    } catch { /* network: fall through */ }
+    return { type: 'onelo:renew_failed', request_id: requestId, reason: 'renew_failed' }
+  }
+
   /** Render an error screen WITH a "Try again" button inside the feedback window
    *  instead of silently closing (no-silent-swallows). The button navigates to
    *  the onelo://feedback_retry sentinel, which handleNav (installed once in
@@ -242,20 +290,13 @@ export class OneloFeedback {
    *  the 1:1 parity with Swift's errorHTML + onRetry (JS just throws — no retry). */
   private async _showError(message: string): Promise<void> {
     if (!this.window || this.window.isDestroyed()) return
-    const safe = message.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c] as string))
-    // Copy + styling mirror Swift OneloFeedback.errorHTML (title / message / white
-    // "Try again" button on #111 dark).
-    const html = `<!doctype html><meta charset="utf-8"><style>
-      *{box-sizing:border-box;margin:0;padding:0}
-      html,body{height:100%}
-      body{background:#111;color:#e5e5e5;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:40px 36px}
-      .title{font-size:17px;font-weight:600;margin-bottom:10px}
-      .msg{font-size:13px;color:#9a9a9a;line-height:1.5;max-width:320px;margin-bottom:28px}
-      .btn{appearance:none;border:0;cursor:pointer;background:#fff;color:#111;font-size:14px;font-weight:600;padding:11px 22px;border-radius:10px}
-      .btn:active{opacity:.8}</style>
-      <div class="title">Couldn't load feedback</div>
-      <div class="msg">${safe}</div>
-      <button class="btn" onclick="window.location.href='${FEEDBACK_RETRY_SENTINEL}'">Try again</button>`
+    // Copy mirrors Swift OneloFeedback.errorHTML; colours, font and the "Try
+    // again" button come from the brand tokens (#681). brandErrorPageHtml escapes.
+    const html = brandErrorPageHtml(this.brand.current(), {
+      title: "Couldn't load feedback",
+      message,
+      retryHref: FEEDBACK_RETRY_SENTINEL,
+    })
     try { await this.window.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`) } catch { /* window gone */ }
   }
 }

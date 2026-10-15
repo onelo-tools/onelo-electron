@@ -15,16 +15,33 @@
  * (named event OR keepalive) resets it; if it fires, the connection is dead and
  * we reconnect. That is more robust than the browser's readyState signal.
  *
- * The endpoint authenticates via the `key` query param (publishable key) — no
- * Authorization header — so it is a plain GET.
+ * The endpoint authenticates via the `X-Publishable-Key` request header
+ * (ADR-0003), so it is a plain GET. The key used to ride the query string,
+ * where it landed in the reverse proxy's access.log on every connect; a header
+ * keeps it out of there.
+ *
+ * The signed-in user is proven with `Authorization: Bearer <access token>`
+ * (#518), read fresh on EVERY (re)connect so a reconnect never carries an
+ * expired token. A refused token (`401 invalid_user_token`) is refreshed once
+ * and retried once; refused again, that connection is opened anonymous (no
+ * Bearer, no `userId`) and the next reconnect tries the user again.
  *
  * Lifecycle is owned by the composition root (`Onelo`), not any single consumer:
  * consumers only `on()` / `addParamProvider()`; `Onelo` calls
  * `start()/stop()/destroy()`.
  */
 import { sdkHeaders } from './sdk-headers'
+import { bearerHeader, sendWithUserToken, type UserTokenSource } from './user-token'
 
 export type SseHandler = (data: Record<string, unknown>) => void
+/** Identity the open connection authenticated. `anonymousFallback` is true when
+ *  a signed-in user's token was refused and the connection went out without a
+ *  user — its snapshots must never replace that user's. */
+export interface StreamConnectionIdentity {
+  userId: string | null
+  anonymousFallback: boolean
+}
+
 type ParamProvider = () => Record<string, string>
 
 // Bounded backoff — near-instant recovery for a network blip, no tight loop on a
@@ -43,6 +60,7 @@ export class OneloEventStream {
   private readonly handlers = new Map<string, SseHandler[]>()
   private readonly paramProviders: ParamProvider[] = []
   private userId: string | null = null
+  private readonly connectionListeners: Array<(identity: StreamConnectionIdentity | null) => void> = []
   private started = false
   private destroyed = false
   private reconnectAttempts = 0
@@ -54,12 +72,15 @@ export class OneloEventStream {
   // Monotonic connection id: a read loop only acts if it is still the current
   // connection (guards against a stale loop resurrecting after stop/reconnect).
   private connEpoch = 0
+  private userTokenRefusedWarned = false
 
   constructor(
     private readonly apiUrl: string,
     private readonly publishableKey: string,
     private readonly sdkVersion?: string,
     private readonly bundleId?: string,
+    /** The signed-in user's access token, sent as `Authorization: Bearer`. */
+    private readonly userToken?: UserTokenSource,
   ) {}
 
   /**
@@ -102,8 +123,24 @@ export class OneloEventStream {
     if (changed) void this._connect()
   }
 
+  /**
+   * Observe which identity the open connection actually authenticated — distinct
+   * from the requested user: a refused token opens an anonymous-fallback
+   * connection. `null` while no connection is open.
+   */
+  onConnectionIdentity(fn: (identity: StreamConnectionIdentity | null) => void): void {
+    this.connectionListeners.push(fn)
+  }
+
+  private _setConnectionIdentity(identity: StreamConnectionIdentity | null): void {
+    for (const fn of this.connectionListeners) {
+      try { fn(identity) } catch { /* a listener must never break the stream */ }
+    }
+  }
+
   /** Close the connection and cancel any pending reconnect. */
   stop(): void {
+    this._setConnectionIdentity(null)
     this.started = false
     this._clearReconnect()
     this._clearSilence()
@@ -129,10 +166,13 @@ export class OneloEventStream {
 
   // ── internals ──────────────────────────────────────────────────────────────
 
-  private _buildUrl(): string {
-    const params = new URLSearchParams({ key: this.publishableKey, sdk_platform: 'electron' })
+  private _buildUrl(anonymous: boolean): string {
+    // The key is NOT here — it travels as the `X-Publishable-Key` request
+    // header (ADR-0003), so it never reaches the reverse proxy's access.log.
+    const params = new URLSearchParams({ sdk_platform: 'electron' })
     if (this.sdkVersion) params.set('sdk_version', this.sdkVersion)
-    if (this.userId) params.set('userId', this.userId)
+    // A connection whose user token was refused is anonymous: no `userId`.
+    if (this.userId && !anonymous) params.set('userId', this.userId)
     for (const provide of this.paramProviders) {
       for (const [k, v] of Object.entries(provide())) params.set(k, v)
     }
@@ -145,21 +185,38 @@ export class OneloEventStream {
     // read loop.
     this._clearReconnect()
     this._abort()
+    this._setConnectionIdentity(null)
     const epoch = ++this.connEpoch
     const controller = new AbortController()
     this.controller = controller
 
     let res: Response
+    let openedAnonymous = false
+    const requestedUserId = this.userId
     try {
-      res = await fetch(this._buildUrl(), {
-        method: 'GET',
-        // sdkHeaders adds X-Bundle-Id (+ X-SDK-Version / X-Onelo-Instance-Id) — the
-        // backend security gate 403s a live app with a registered bundle on
-        // /features/stream without X-Bundle-Id → the stream would reconnect-loop
-        // forever and realtime (features_updated / session.revoked) would be dead.
-        headers: { Accept: 'text/event-stream', ...sdkHeaders(this.bundleId) },
-        signal: controller.signal,
-      })
+      ({ res } = await sendWithUserToken(this.userToken, async ({ token, anonymous }) => {
+        openedAnonymous = anonymous
+        const r = await fetch(this._buildUrl(anonymous), {
+          method: 'GET',
+          // sdkHeaders adds X-Bundle-Id (+ X-SDK-Version / X-Onelo-Instance-Id) — the
+          // backend security gate 403s a live app with a registered bundle on
+          // /features/stream without X-Bundle-Id → the stream would reconnect-loop
+          // forever and realtime (features_updated / session.revoked) would be dead.
+          headers: {
+            Accept: 'text/event-stream',
+            ...sdkHeaders(this.bundleId),
+            // ADR-0003: the Event Stream's credential. A header-authenticated
+            // connection carries no `Deprecation`/`Sunset` — unlike `?key=`.
+            'X-Publishable-Key': this.publishableKey,
+            ...bearerHeader(token),
+          },
+          signal: controller.signal,
+        })
+        // Only a 401 body is read (to spot `invalid_user_token`); a 200 body is
+        // the event stream itself and must be left for the reader below.
+        const json = r.status === 401 ? await r.json().catch(() => null) : null
+        return { status: r.status, json, res: r }
+      }, () => this._warnUserTokenRefused()))
     } catch {
       // Network error before headers — transient; back off (unless superseded).
       if (epoch === this.connEpoch && this.started && !this.destroyed) this._scheduleReconnect()
@@ -181,6 +238,7 @@ export class OneloEventStream {
       return
     }
 
+    this._setConnectionIdentity({ userId: requestedUserId, anonymousFallback: openedAnonymous && requestedUserId !== null })
     this._armSilence(epoch)
     const reader = res.body.getReader()
     const decoder = new TextDecoder()
@@ -218,6 +276,15 @@ export class OneloEventStream {
     // Stream ended (server closed / dropped) — reconnect unless we're the stale
     // loop or were deliberately stopped.
     if (epoch === this.connEpoch && this.started && !this.destroyed) this._scheduleReconnect()
+  }
+
+  private _warnUserTokenRefused(): void {
+    if (this.userTokenRefusedWarned) return
+    this.userTokenRefusedWarned = true
+    console.warn(
+      '[Onelo] The signed-in user\'s access token was refused by the Event Stream (invalid_user_token) ' +
+      'even after a refresh, so the stream was opened without a user.',
+    )
   }
 
   /** Parse one SSE frame (`event:`/`data:` lines) and dispatch to handlers. */
