@@ -35,3 +35,5 @@ export type {
 } from './types'
 // #681: the brand tokens every piece of SDK chrome is painted from.
 export type { BrandTokens } from '@onelo/core'
+export { OneloAffiliates, AFFILIATE_STORAGE_KEY } from './affiliates'
+export type { AffiliateStore } from './affiliates'

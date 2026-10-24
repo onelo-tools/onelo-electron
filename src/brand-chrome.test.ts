@@ -44,7 +44,8 @@ describe('Electron chrome from brand_tokens (#681)', () => {
   it('skeletons: page ground, card/border blocks, card and button radii', () => {
     const portal = portalSkeletonHtml(T)
     expect(portal).toContain('body{background:#f5f5f4')
-    expect(portal).toContain('background-color:#ffffff')
+    // #948: light page → soft blocks take the border colour, not the white card.
+    expect(portal).toContain('.sk{background-color:#e4e4e7')
     expect(portal).toContain('border-radius:21px')
     const fb = feedbackSkeletonHtml(T)
     expect(fb).toContain('background:#f5f5f4')

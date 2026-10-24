@@ -379,6 +379,7 @@ var require_brand_tokens = __commonJS({
     exports2.brandTokensFromResponse = brandTokensFromResponse2;
     exports2.withAlpha = withAlpha;
     exports2.statusColor = statusColor;
+    exports2.skeletonSoftFill = skeletonSoftFill;
     exports2.skeletonCss = skeletonCss;
     exports2.spinnerCss = spinnerCss;
     exports2.portalSkeletonHtml = portalSkeletonHtml2;
@@ -530,11 +531,15 @@ var require_brand_tokens = __commonJS({
       }
     };
     exports2.BrandSource = BrandSource3;
+    function skeletonSoftFill(t) {
+      return t.light_bg ? t.border : t.card_bg;
+    }
     function skeletonCss(t) {
+      const soft = skeletonSoftFill(t);
       const sweep = `background-image:linear-gradient(90deg,transparent 0%,${t.spinner_track} 50%,transparent 100%);background-size:60vw 100%;background-repeat:no-repeat;background-attachment:fixed;animation:onelo-shimmer 2.4s linear infinite`;
       return [
         "@keyframes onelo-shimmer{0%{background-position:-60vw 0}100%{background-position:100vw 0}}",
-        `.sk{background-color:${t.card_bg};${sweep};border-radius:${t.field_radius}px}`,
+        `.sk{background-color:${soft};${sweep};border-radius:${t.field_radius}px}`,
         `.strong{background-color:${t.border};${sweep};border-radius:${t.field_radius}px}`
       ].join("\n");
     }
@@ -571,25 +576,27 @@ ${skeletonCss(t)}
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-body{background:${t.page_bg};font-family:${t.body_font};padding:40px 36px 32px;overflow:hidden}
+body{background:${t.page_bg};font-family:${t.body_font};padding:24px 24px 0;overflow:hidden}
 ${skeletonCss(t)}
-.icon{width:64px;height:64px;border-radius:${t.card_radius}px;margin:0 auto 16px}
-.title{width:220px;height:22px;margin:0 auto 40px}
-.cards{display:flex;gap:12px;margin-bottom:32px}
-.card{flex:1;height:76px;border-radius:${t.card_radius}px}
-.label{width:60px;height:13px;margin-bottom:8px}
-.input{width:100%;height:44px;margin-bottom:24px}
-.textarea{width:100%;height:110px;margin-bottom:32px}
+.icon{width:64px;height:64px;border-radius:${t.card_radius}px;margin:0 auto 14px}
+.col{width:100%;max-width:360px;margin:0 auto;display:flex;flex-direction:column;gap:16px}
+.title{width:220px;height:22px;margin:0 auto 4px}
+.cards{display:flex;gap:8px}
+.card{flex:1;height:56px;border-radius:${t.card_radius}px}
+.field{display:flex;flex-direction:column;gap:6px}
+.label{width:60px;height:13px}
+.input{width:100%;height:44px}
+.textarea{width:100%;height:100px}
 .btn{width:100%;height:48px;border-radius:${t.button_radius}px}
 </style></head><body>
 <div class="sk icon"></div>
+<div class="col">
 <div class="sk title"></div>
 <div class="cards"><div class="sk card"></div><div class="sk card"></div><div class="sk card"></div></div>
-<div class="sk label"></div>
-<div class="strong input"></div>
-<div class="sk label"></div>
-<div class="strong textarea"></div>
+<div class="field"><div class="sk label"></div><div class="strong input"></div></div>
+<div class="field"><div class="sk label"></div><div class="strong textarea"></div></div>
 <div class="strong btn"></div>
+</div>
 </body></html>`;
     }
   }
@@ -726,6 +733,109 @@ var require_dist = __commonJS({
   }
 });
 
+// src/storage.ts
+var storage_exports = {};
+__export(storage_exports, {
+  SecureTokenStorage: () => SecureTokenStorage
+});
+var import_path, import_fs, SecureTokenStorage;
+var init_storage = __esm({
+  "src/storage.ts"() {
+    "use strict";
+    import_path = require("path");
+    import_fs = require("fs");
+    SecureTokenStorage = class {
+      constructor(storePath) {
+        this.cache = /* @__PURE__ */ new Map();
+        if (storePath) {
+          this.storePath = storePath;
+        } else {
+          this.storePath = "";
+        }
+      }
+      getStorePath() {
+        if (this.storePath) return this.storePath;
+        const { app } = require("electron");
+        const dir = (0, import_path.join)(app.getPath("userData"), "onelo");
+        if (!(0, import_fs.existsSync)(dir)) (0, import_fs.mkdirSync)(dir, { recursive: true });
+        this.storePath = (0, import_path.join)(dir, "tokens.enc");
+        return this.storePath;
+      }
+      loadFromDisk() {
+        const path = this.getStorePath();
+        if (!(0, import_fs.existsSync)(path)) return;
+        try {
+          const raw = JSON.parse((0, import_fs.readFileSync)(path, "utf-8"));
+          const { safeStorage } = require("electron");
+          for (const [key, bufArr] of Object.entries(raw)) {
+            try {
+              const buf = Buffer.from(bufArr);
+              const value = safeStorage.decryptString(buf);
+              this.cache.set(key, value);
+            } catch {
+            }
+          }
+        } catch {
+        }
+      }
+      saveToDisk() {
+        const path = this.getStorePath();
+        const { safeStorage } = require("electron");
+        const out = {};
+        for (const [key, value] of this.cache.entries()) {
+          const encrypted = safeStorage.encryptString(value);
+          out[key] = Array.from(encrypted);
+        }
+        (0, import_fs.writeFileSync)(path, JSON.stringify(out), "utf-8");
+      }
+      async set(key, value) {
+        const { safeStorage } = await import("electron");
+        if (!safeStorage.isEncryptionAvailable()) {
+          throw new Error("safeStorage encryption is not available on this system");
+        }
+        if (this.cache.size === 0) this.loadFromDisk();
+        this.cache.set(key, value);
+        this.saveToDisk();
+      }
+      async get(key) {
+        if (this.cache.size === 0) this.loadFromDisk();
+        return this.cache.get(key) ?? null;
+      }
+      async delete(key) {
+        this.cache.delete(key);
+        this.saveToDisk();
+      }
+      async clear() {
+        this.cache.clear();
+        const path = this.getStorePath();
+        if ((0, import_fs.existsSync)(path)) (0, import_fs.writeFileSync)(path, "{}", "utf-8");
+      }
+      /**
+       * Synchronous presence check for one or more stored keys, WITHOUT decrypting.
+       * Reads the raw encrypted store straight off disk (`readFileSync`) and reports
+       * whether EVERY requested key is present. Backs the cold-start
+       * `hasStoredSession()` primitive (#36): a fast, init-independent "am I logged
+       * in?" hint. Deliberately checks key presence only (no `decryptString`) so it
+       * never depends on the OS keychain being unlockable and never throws.
+       * The on-disk file is the source of truth — `set`/`delete`/`clear` all persist
+       * synchronously, so this stays consistent with the async accessors.
+       * Returns false if the store file is missing, empty, or unreadable.
+       */
+      hasKeysSync(...keys) {
+        if (keys.length === 0) return false;
+        const path = this.getStorePath();
+        if (!(0, import_fs.existsSync)(path)) return false;
+        try {
+          const raw = JSON.parse((0, import_fs.readFileSync)(path, "utf-8"));
+          return keys.every((k) => Object.prototype.hasOwnProperty.call(raw, k));
+        } catch {
+          return false;
+        }
+      }
+    };
+  }
+});
+
 // src/codesign.ts
 function getCodesignFingerprint() {
   try {
@@ -840,7 +950,7 @@ var init_instance_id = __esm({
 var version;
 var init_package = __esm({
   "package.json"() {
-    version = "0.61.1";
+    version = "0.63.0";
   }
 });
 
@@ -907,9 +1017,11 @@ var init_sdk_headers = __esm({
 // src/index.ts
 var index_exports = {};
 __export(index_exports, {
+  AFFILIATE_STORAGE_KEY: () => AFFILIATE_STORAGE_KEY,
   FeatureState: () => FeatureState,
   IPC_CHANNELS: () => IPC_CHANNELS,
   Onelo: () => Onelo,
+  OneloAffiliates: () => OneloAffiliates,
   OneloConsent: () => OneloConsent,
   OneloElectronAuth: () => OneloElectronAuth,
   OneloElectronCustomerPortal: () => OneloElectronCustomerPortal,
@@ -930,99 +1042,7 @@ module.exports = __toCommonJS(index_exports);
 // src/auth.ts
 var import_core3 = __toESM(require_dist());
 var import_core4 = __toESM(require_dist());
-
-// src/storage.ts
-var import_path = require("path");
-var import_fs = require("fs");
-var SecureTokenStorage = class {
-  constructor(storePath) {
-    this.cache = /* @__PURE__ */ new Map();
-    if (storePath) {
-      this.storePath = storePath;
-    } else {
-      this.storePath = "";
-    }
-  }
-  getStorePath() {
-    if (this.storePath) return this.storePath;
-    const { app } = require("electron");
-    const dir = (0, import_path.join)(app.getPath("userData"), "onelo");
-    if (!(0, import_fs.existsSync)(dir)) (0, import_fs.mkdirSync)(dir, { recursive: true });
-    this.storePath = (0, import_path.join)(dir, "tokens.enc");
-    return this.storePath;
-  }
-  loadFromDisk() {
-    const path = this.getStorePath();
-    if (!(0, import_fs.existsSync)(path)) return;
-    try {
-      const raw = JSON.parse((0, import_fs.readFileSync)(path, "utf-8"));
-      const { safeStorage } = require("electron");
-      for (const [key, bufArr] of Object.entries(raw)) {
-        try {
-          const buf = Buffer.from(bufArr);
-          const value = safeStorage.decryptString(buf);
-          this.cache.set(key, value);
-        } catch {
-        }
-      }
-    } catch {
-    }
-  }
-  saveToDisk() {
-    const path = this.getStorePath();
-    const { safeStorage } = require("electron");
-    const out = {};
-    for (const [key, value] of this.cache.entries()) {
-      const encrypted = safeStorage.encryptString(value);
-      out[key] = Array.from(encrypted);
-    }
-    (0, import_fs.writeFileSync)(path, JSON.stringify(out), "utf-8");
-  }
-  async set(key, value) {
-    const { safeStorage } = await import("electron");
-    if (!safeStorage.isEncryptionAvailable()) {
-      throw new Error("safeStorage encryption is not available on this system");
-    }
-    if (this.cache.size === 0) this.loadFromDisk();
-    this.cache.set(key, value);
-    this.saveToDisk();
-  }
-  async get(key) {
-    if (this.cache.size === 0) this.loadFromDisk();
-    return this.cache.get(key) ?? null;
-  }
-  async delete(key) {
-    this.cache.delete(key);
-    this.saveToDisk();
-  }
-  async clear() {
-    this.cache.clear();
-    const path = this.getStorePath();
-    if ((0, import_fs.existsSync)(path)) (0, import_fs.writeFileSync)(path, "{}", "utf-8");
-  }
-  /**
-   * Synchronous presence check for one or more stored keys, WITHOUT decrypting.
-   * Reads the raw encrypted store straight off disk (`readFileSync`) and reports
-   * whether EVERY requested key is present. Backs the cold-start
-   * `hasStoredSession()` primitive (#36): a fast, init-independent "am I logged
-   * in?" hint. Deliberately checks key presence only (no `decryptString`) so it
-   * never depends on the OS keychain being unlockable and never throws.
-   * The on-disk file is the source of truth — `set`/`delete`/`clear` all persist
-   * synchronously, so this stays consistent with the async accessors.
-   * Returns false if the store file is missing, empty, or unreadable.
-   */
-  hasKeysSync(...keys) {
-    if (keys.length === 0) return false;
-    const path = this.getStorePath();
-    if (!(0, import_fs.existsSync)(path)) return false;
-    try {
-      const raw = JSON.parse((0, import_fs.readFileSync)(path, "utf-8"));
-      return keys.every((k) => Object.prototype.hasOwnProperty.call(raw, k));
-    } catch {
-      return false;
-    }
-  }
-};
+init_storage();
 
 // src/types.ts
 var import_core = __toESM(require_dist());
@@ -3768,6 +3788,129 @@ var OneloWaitlist = class {
   }
 };
 
+// src/affiliates.ts
+var AFFILIATE_STORAGE_KEY = "onelo_aff";
+var UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+var CODE = /^[A-Za-z0-9]{6,32}$/;
+function queryOf(url) {
+  const q = url.split("#")[0].split("?")[1] ?? "";
+  const out = {};
+  for (const part of q.split("&")) {
+    const i = part.indexOf("=");
+    if (i <= 0) continue;
+    try {
+      out[decodeURIComponent(part.slice(0, i))] = decodeURIComponent(part.slice(i + 1).replace(/\+/g, " "));
+    } catch {
+    }
+  }
+  return out;
+}
+var OneloAffiliates = class {
+  constructor(publishableKey, store, post, session) {
+    this.publishableKey = publishableKey;
+    this.store = store;
+    this.post = post;
+    this.session = session;
+  }
+  async kept() {
+    try {
+      const raw = await this.store.get(AFFILIATE_STORAGE_KEY);
+      const parsed = raw ? JSON.parse(raw) : null;
+      return parsed && typeof parsed.click_id === "string" && UUID.test(parsed.click_id) ? parsed : null;
+    } catch {
+      return null;
+    }
+  }
+  keep(kept) {
+    return this.store.set(AFFILIATE_STORAGE_KEY, JSON.stringify(kept));
+  }
+  /** Capture the referral in `url` after the user's answer. Stores nothing without consent. */
+  async capture(url, { consent }) {
+    const q = queryOf(url);
+    const code = q.ref && CODE.test(q.ref) ? q.ref.toLowerCase() : null;
+    const forwarded = q.onelo_click && UUID.test(q.onelo_click) ? q.onelo_click : null;
+    if (!consent) {
+      if (code) await this.post("/v1/sdk/affiliates/refused", { publishableKey: this.publishableKey, code });
+      return { kept: false };
+    }
+    const existing = await this.kept();
+    if (code) {
+      const res = await this.post("/v1/sdk/affiliates/click", {
+        publishableKey: this.publishableKey,
+        code,
+        source: "sdk",
+        ...existing ? { existing: existing.click_id } : {}
+      });
+      const id = res?.json.click_id;
+      if (res?.status === 200 && typeof id === "string" && UUID.test(id) && id !== existing?.click_id) {
+        await this.keep({ click_id: id });
+      }
+    } else if (forwarded && forwarded !== existing?.click_id) {
+      await this.keep({ click_id: forwarded });
+    }
+    await this.claimForSession();
+    return { kept: await this.kept() !== null };
+  }
+  /** Tie the kept click to the signed-in user once. Called on every sign-in. */
+  async claimForSession() {
+    const kept = await this.kept();
+    if (!kept) return;
+    const s = await this.session().catch(() => null);
+    if (!s || kept.claimed_for === s.userId) return;
+    const res = await this.post("/v1/sdk/affiliates/claim", {
+      publishableKey: this.publishableKey,
+      userToken: s.accessToken,
+      clickId: kept.click_id
+    });
+    if (res?.status === 200) await this.keep({ ...kept, claimed_for: s.userId });
+  }
+};
+function affiliatePost(apiUrl, bundleId) {
+  return async (path, body) => {
+    try {
+      const { sdkHeaders: sdkHeaders2 } = await Promise.resolve().then(() => (init_sdk_headers(), sdk_headers_exports));
+      const res = await fetch(`${apiUrl}${path}`, {
+        method: "POST",
+        headers: { ...sdkHeaders2(bundleId), "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      });
+      const json = await res.json().catch(() => ({}));
+      return { status: res.status, json };
+    } catch {
+      return null;
+    }
+  };
+}
+function affiliateStore() {
+  let inner = null;
+  const open = async () => {
+    if (inner) return inner;
+    const { SecureTokenStorage: SecureTokenStorage2 } = await Promise.resolve().then(() => (init_storage(), storage_exports));
+    const { join: join3 } = await import("path");
+    const { mkdirSync: mkdirSync2 } = await import("fs");
+    const { app } = require("electron");
+    const dir = join3(app.getPath("userData"), "onelo");
+    mkdirSync2(dir, { recursive: true });
+    inner = new SecureTokenStorage2(join3(dir, "affiliates.enc"));
+    return inner;
+  };
+  return {
+    async get(key) {
+      try {
+        return await (await open()).get(key);
+      } catch {
+        return null;
+      }
+    },
+    async set(key, value) {
+      try {
+        await (await open()).set(key, value);
+      } catch {
+      }
+    }
+  };
+}
+
 // src/customer-portal.ts
 var import_core8 = __toESM(require_dist());
 init_sdk_headers();
@@ -4938,6 +5081,15 @@ var Onelo = class {
     this.feedback.setBrandSource(this.auth.brand);
     this.forms = new OneloForms(config.apiUrl, config.publishableKey, config.bundleId);
     this.waitlist = new OneloWaitlist(config.apiUrl, config.publishableKey, config.bundleId);
+    this.affiliates = new OneloAffiliates(
+      config.publishableKey,
+      affiliateStore(),
+      affiliatePost(config.apiUrl, config.bundleId),
+      async () => {
+        const session = await this.auth.getSession();
+        return session ? { accessToken: session.accessToken, userId: session.user.id } : null;
+      }
+    );
     this.customerPortal = new OneloElectronCustomerPortal(
       config.apiUrl,
       config.publishableKey,
@@ -4984,6 +5136,7 @@ var Onelo = class {
       featuresBound = true;
       this.features._load(userId);
       if (userId && this.autoPresentConsentGate) void this.consent.presentGateIfNeeded();
+      if (userId) void this.affiliates.claimForSession();
     });
     void this.auth.getSession().then((session) => {
       if (!featuresBound) void this.features._load(session?.user.id ?? null);
@@ -5048,12 +5201,15 @@ var Onelo = class {
 };
 
 // src/index.ts
+init_storage();
 var import_core11 = __toESM(require_dist());
 // Annotate the CommonJS export names for ESM import in node:
 0 && (module.exports = {
+  AFFILIATE_STORAGE_KEY,
   FeatureState,
   IPC_CHANNELS,
   Onelo,
+  OneloAffiliates,
   OneloConsent,
   OneloElectronAuth,
   OneloElectronCustomerPortal,

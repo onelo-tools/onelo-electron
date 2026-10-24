@@ -1070,6 +1070,58 @@ declare class OneloWaitlist {
     }>;
 }
 
+/**
+ * Affiliate referral capture for apps with the Onelo SDK (#929).
+ *
+ * An Affiliate link that opens your app carries `?ref=<code>` (the Affiliate
+ * linking straight to the app) or `?onelo_click=<id>` (forwarded by Onelo's
+ * tracked link after consent there). Pass that link with the user's answer:
+ *
+ *   app.on('open-url', (_e, url) => onelo.affiliates.capture(url, { consent }))
+ *
+ * - `consent: false` stores nothing on the device; a `?ref=` only adds one to
+ *   the Affiliate's anonymous total.
+ * - `consent: true` keeps the click (safeStorage entry `onelo_aff`, Main process). Which of two
+ *   clicks stays is the program's winner rule, decided by Onelo.
+ *
+ * The kept click is tied to the user who signs in, so their purchase is
+ * attributed whichever checkout opens.
+ */
+declare const AFFILIATE_STORAGE_KEY = "onelo_aff";
+interface AffiliateStore {
+    get(key: string): Promise<string | null>;
+    set(key: string, value: string): Promise<void>;
+}
+type Post = (path: string, body: Record<string, unknown>) => Promise<{
+    status: number;
+    json: Record<string, unknown>;
+} | null>;
+type Session = () => Promise<{
+    accessToken: string;
+    userId: string;
+} | null>;
+interface Kept {
+    click_id: string;
+    claimed_for?: string;
+}
+declare class OneloAffiliates {
+    private readonly publishableKey;
+    private readonly store;
+    private readonly post;
+    private readonly session;
+    constructor(publishableKey: string, store: AffiliateStore, post: Post, session: Session);
+    kept(): Promise<Kept | null>;
+    private keep;
+    /** Capture the referral in `url` after the user's answer. Stores nothing without consent. */
+    capture(url: string, { consent }: {
+        consent: boolean;
+    }): Promise<{
+        kept: boolean;
+    }>;
+    /** Tie the kept click to the signed-in user once. Called on every sign-in. */
+    claimForSession(): Promise<void>;
+}
+
 /** Where a portal opens. `'change_plan'` lands straight in the plan picker —
  *  the hosted portal asks the backend where the upgrade goes (#587). */
 type PortalIntent = 'change_plan';
@@ -1421,6 +1473,8 @@ declare class Onelo {
     readonly feedback: OneloFeedback;
     readonly forms: OneloForms;
     readonly waitlist: OneloWaitlist;
+    /** Affiliate referral capture (#929): `affiliates.capture(url, { consent })` (Main process). */
+    readonly affiliates: OneloAffiliates;
     readonly customerPortal: OneloElectronCustomerPortal;
     /** Legal-consent gate (Terms/Privacy updates for already-signed-in users). */
     readonly consent: OneloConsent;
@@ -1486,4 +1540,4 @@ declare class SecureTokenStorage {
     hasKeysSync(...keys: string[]): boolean;
 }
 
-export { type FeatureReason, type FeatureSnapshot, FeatureState, type FeatureStatus, IPC_CHANNELS, type MonitorContext, type MonitorEventOptions, Onelo, OneloConsent, type OneloConsentEnforcement, type OneloConsentRequirement, OneloElectronAuth, type OneloElectronConfig, OneloElectronCustomerPortal, OneloFeatures, OneloFeaturesError, type OneloFeaturesErrorCode, OneloFeedback, OneloForms, OneloMonitor, OneloStore, OneloWaitlist, type PortalIntent, SecureTokenStorage, type UpgradeHint };
+export { AFFILIATE_STORAGE_KEY, type AffiliateStore, type FeatureReason, type FeatureSnapshot, FeatureState, type FeatureStatus, IPC_CHANNELS, type MonitorContext, type MonitorEventOptions, Onelo, OneloAffiliates, OneloConsent, type OneloConsentEnforcement, type OneloConsentRequirement, OneloElectronAuth, type OneloElectronConfig, OneloElectronCustomerPortal, OneloFeatures, OneloFeaturesError, type OneloFeaturesErrorCode, OneloFeedback, OneloForms, OneloMonitor, OneloStore, OneloWaitlist, type PortalIntent, SecureTokenStorage, type UpgradeHint };
