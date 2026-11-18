@@ -11,7 +11,7 @@ vi.mock('@onelo/core', async () => {
 
 import { OneloStore } from './store'
 import { httpGet } from '@onelo/core'
-import { BrandSource } from '@onelo/core'
+import { BrandSource, deviceLanguage } from '@onelo/core'
 
 const SESSION = {
   accessToken: 'tok', refreshToken: 'r', expiresAt: 9e9,
@@ -43,7 +43,7 @@ describe('OneloStore.initiateStoreFlow()', () => {
     const [url, headers] = (httpGet as any).mock.calls[0]
     expect(url).toContain('/api/sdk/paywall/store-initiate')
     expect(url).toContain('callback_scheme=myapp')
-    expect(url).toContain('lang=en')
+    expect(url).toContain(`lang=${encodeURIComponent(deviceLanguage())}`)
     expect(headers).toMatchObject({ Authorization: 'Bearer tok' })
   })
 

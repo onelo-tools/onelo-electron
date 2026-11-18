@@ -54,6 +54,16 @@ interface OneloElectronConfig {
      */
     autoLifecycleRefresh?: boolean;
     /**
+     * The App's language for its App User (a BCP 47 tag such as `"de"` or
+     * `"pt-PT"`), or omitted for the device language. The Hosted Pages and this
+     * SDK's own texts ("Try again", window titles, feature badges) use it when it
+     * is one of your App Languages; otherwise the device language when it is
+     * one, otherwise your App's default. A language passed to a single call
+     * (`store.openInBrowser('fr')`, `waitlist.join(…, { language })`) wins for
+     * that call. `onelo.auth.pageLanguage` tells you the language chosen (#1078).
+     */
+    language?: string;
+    /**
      * Status returned by `onelo.features.feature(name)` for a slug not (yet) in the
      * resolved snapshot. Fail-closed 'hidden' by default — a feature instrumented in
      * code but not enabled in the dashboard stays hidden in production. Set 'enabled'
@@ -306,8 +316,36 @@ declare class OneloElectronAuth {
      * `lastPresentedSurface`.
      */
     lastPresentedSurface: string | null;
+    /**
+     * #1078 — the App's language for its App User (`OneloElectronConfig.language`),
+     * or undefined for the device language. Sent wherever the SDK asks for a Page
+     * Language: `/api/sdk/config` (this SDK's own texts), sign-in, store, upgrade,
+     * consent and waitlist calls that pass no language of their own.
+     */
+    readonly language: string | undefined;
+    /**
+     * #1078 — the App User's Page Language (ADR-0043): the language this SDK
+     * draws its own texts in ("Try again", window titles, feature badges), the
+     * same one the Hosted Pages use. The App's language when it is one of the App
+     * Languages, else the device language when it is, else the App's default —
+     * chosen by the backend in `/api/sdk/config` and kept for the next launch.
+     * `"en"` until the first answer.
+     */
+    get pageLanguage(): string;
     constructor(config: OneloElectronConfig);
     private initialize;
+    /** The sign-in window's title: the App's name as written, or "Sign in" in
+     *  the Page Language while no name is known (#1078). */
+    private windowTitle;
+    /** True once `/api/sdk/config` answered a Page Language in this process. */
+    private pageLanguageAnswered;
+    /**
+     * Adopt the Page Language `/api/sdk/config` answered (#1078) and keep it for
+     * the next launch. Null (an older backend, or one that could not read the App
+     * Languages) keeps the current one. Keeping it is best-effort: storage
+     * unavailable only costs the next launch's first paint.
+     */
+    private adoptPageLanguageAnswer;
     private waitReady;
     /**
      * Resolves when /api/sdk/config has been fetched. Safe to call multiple times.
@@ -697,7 +735,8 @@ declare class FeatureState {
     get isBeta(): boolean;
     get isComingSoon(): boolean;
     /** Promo/lock badge (parity with Swift/JS): New/Beta/Coming Soon, 🔒 for greyed
-     *  (locked — never hide it), and "Available in <plan>" for upsell. */
+     *  (locked — never hide it), and "Available in <plan>" for upsell. In the
+     *  Page Language (#1078); the plan name is shown as written. */
     get badgeLabel(): string | null;
     /** Non-null when the feature is plan-blocked AND the backend named the
      *  unlocking plan — surface in upgrade-prompt UI (parity with JS). */
@@ -1060,9 +1099,18 @@ declare class OneloWaitlist {
     private readonly apiUrl;
     private readonly publishableKey;
     private readonly bundleId?;
-    constructor(apiUrl: string, publishableKey: string, bundleId?: string | undefined);
+    /** #1078: the App's language (`OneloElectronConfig.language`), sent when a
+     *  join passes none of its own; else the device language. */
+    private readonly language?;
+    constructor(apiUrl: string, publishableKey: string, bundleId?: string | undefined, 
+    /** #1078: the App's language (`OneloElectronConfig.language`), sent when a
+     *  join passes none of its own; else the device language. */
+    language?: string | undefined);
     join(slug: string | undefined, email: string, 
-    /** #818: the checkboxes your form showed — `{ consent: { marketing, custom } }`. */
+    /** #818: the checkboxes your form showed — `{ consent: { marketing, custom } }`.
+     *  #1038: `language` — the App's language for this sign-up; omitted,
+     *  `OneloElectronConfig.language` (#1078), else the device language, is
+     *  sent and the backend stores the join's Page Language. */
     options?: WaitlistJoinOptions): Promise<{
         success: boolean;
         position?: number;
@@ -1421,6 +1469,10 @@ declare class OneloStore {
      * cold-start omits it. Mirrors Swift `initiateStoreFlow(lang:)`. Use for a custom
      * presentation; `open()`/`openInBrowser()` wrap it.
      *
+     * @param lang  The App's language for the store. Omitted, `OneloElectronConfig.language`
+     *   is sent, else the device language (#1039, #1078); the backend picks the
+     *   Page Language within the App Languages.
+     *
      * @throws OneloError('server_error') on `store_not_configured` (409) /
      *   `paywall_not_enabled` (403) — DO NOT open a window in that case — or any
      *   other non-200. `OneloError('invalid_publishable_key')` on 401.
@@ -1458,6 +1510,8 @@ declare class OneloStore {
      * (purchase, plan switch, expired link) closes it and the app sees the new plan
      * — a system browser never reports back. Resolves when the window closes.
      *
+     * @param lang  The App's language for the page. Omitted, `OneloElectronConfig.language`
+     *   is sent, else the device language (#1039, #1078).
      * @param parentWindow  Pass your main window to present modally.
      * @throws OneloError('not_authenticated') when signed out (401) or
      *   `OneloError('server_error')` on `plan_not_purchasable` (404) /

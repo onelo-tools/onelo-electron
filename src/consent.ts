@@ -1,4 +1,5 @@
 import { httpGet, httpPost } from '@onelo/core'
+import { oneloText, requestLanguage } from './text'
 import { OneloError } from './types'
 import { sdkHeaders } from './sdk-headers'
 import type { OneloElectronAuth } from './auth'
@@ -212,8 +213,11 @@ export class OneloConsent {
     const session = await this.auth.getSession()
     if (!session) return []
     try {
+      // #1073: the App's language, else the device language (#1078); the
+      // backend picks the Page Language (within the App Languages) and links
+      // each document in it.
       const { status, json } = await httpGet(
-        `${this.apiUrl}/v1/sdk/consent/required`,
+        `${this.apiUrl}/v1/sdk/consent/required?lang=${encodeURIComponent(requestLanguage(undefined, this.auth.language))}`,
         sdkHeaders(this.bundleId, {
           Authorization: `Bearer ${session.accessToken}`,
           'X-Publishable-Key': this.publishableKey,
@@ -450,7 +454,7 @@ export class OneloConsent {
       minimizable: false,
       maximizable: false,
       webPreferences: { nodeIntegration: false, contextIsolation: true },
-      title: 'Review & Accept',
+      title: oneloText('reviewAndAccept'), // #1078: in the Page Language
     })
     this._gateWindow = win
 

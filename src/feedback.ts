@@ -5,6 +5,7 @@ import { sdkHeaders } from './sdk-headers'
 import { bearerHeader, sendWithUserToken, type UserTokenSource } from './user-token'
 import { BrandSource } from '@onelo/core'
 import { brandErrorPageHtml, feedbackSkeletonHtml } from './brand-chrome'
+import { oneloText } from './text'
 
 interface FeedbackConfig {
   publishableKey: string
@@ -162,7 +163,7 @@ export class OneloFeedback {
       minWidth: 480,
       minHeight: 680,
       resizable: true,
-      title: 'Send Feedback',
+      title: oneloText('sendFeedback'), // #1078: in the Page Language
       backgroundColor: this.brand.current().page_bg,
       webPreferences: { nodeIntegration: false, contextIsolation: true },
     })
@@ -232,8 +233,10 @@ export class OneloFeedback {
       const result = await this._initiate(options)
       if (!result.ok) {
         // Show the error in-window instead of silently closing (no-silent-
-        // swallows — mirrors Swift's errorHTML). The user sees what happened.
-        await this._showError(`Couldn't load feedback (HTTP ${result.status}).`)
+        // swallows — mirrors Swift's errorHTML). The App User sees what
+        // happened in the Page Language (#1078); the status is the developer's.
+        console.warn(`[Onelo] Couldn't load feedback: feedback/initiate answered HTTP ${result.status}`)
+        await this._showError(oneloText('somethingWentWrong'))
         return
       }
       const hosted_url = result.hostedUrl
@@ -245,8 +248,9 @@ export class OneloFeedback {
       // handleNav (installed once in _openAsync) intercepts. Re-injected on every
       // (re)load of the hosted form.
       await this.window.webContents.executeJavaScript(POSTMESSAGE_RELAY_SCRIPT)
-    } catch {
-      await this._showError("Couldn't reach the feedback service. Check your connection and try again.")
+    } catch (e) {
+      console.warn(`[Onelo] Couldn't reach the feedback service: ${e instanceof Error ? e.message : String(e)}`)
+      await this._showError(oneloText('connectionProblem'))
     }
   }
 
@@ -293,7 +297,7 @@ export class OneloFeedback {
     // Copy mirrors Swift OneloFeedback.errorHTML; colours, font and the "Try
     // again" button come from the brand tokens (#681). brandErrorPageHtml escapes.
     const html = brandErrorPageHtml(this.brand.current(), {
-      title: "Couldn't load feedback",
+      title: oneloText('feedbackFailedTitle'),
       message,
       retryHref: FEEDBACK_RETRY_SENTINEL,
     })

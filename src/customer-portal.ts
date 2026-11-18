@@ -4,6 +4,7 @@ import { sdkHeaders } from './sdk-headers'
 import type { OneloElectronAuth } from './auth'
 import { classifyHandBack } from './hand-back'
 import { portalSkeletonHtml } from './brand-chrome'
+import { oneloText } from './text'
 import type { PlanChange } from './plan-change'
 
 // Pre-connect loading skeleton (brand-chrome.ts `portalSkeletonHtml`), shown in
@@ -321,7 +322,7 @@ export class OneloElectronCustomerPortal {
             // hosted page paints (#681; matches the skeleton + hosted portal).
             backgroundColor: this.auth.brand.current().page_bg,
             webPreferences: { nodeIntegration: false, contextIsolation: true },
-            title: 'Manage Account',
+            title: oneloText('manageAccount'), // #1078: in the Page Language
           })
 
           win.setMenuBarVisibility(false)

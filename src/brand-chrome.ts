@@ -8,6 +8,7 @@
  * grounds: a light-branded app gets a light error page with its own button.
  */
 import { portalSkeletonHtml, feedbackSkeletonHtml, type BrandTokens } from '@onelo/core'
+import { oneloText, pageLanguage } from './text'
 
 /** HTML-escape a value placed in page text. */
 function esc(s: string): string {
@@ -16,13 +17,15 @@ function esc(s: string): string {
 
 /**
  * An error screen with a "Try again" button. The button navigates `retryHref`
- * (an SDK sentinel URL the window's will-navigate handler intercepts).
+ * (an SDK sentinel URL the window's will-navigate handler intercepts). The
+ * button says "Try again" in the Page Language unless `buttonLabel` is given
+ * (#1078).
  */
 export function brandErrorPageHtml(
   t: BrandTokens,
-  { title, message, retryHref, buttonLabel = 'Try again' }: { title: string; message: string; retryHref: string; buttonLabel?: string },
+  { title, message, retryHref, buttonLabel = oneloText('tryAgain') }: { title: string; message: string; retryHref: string; buttonLabel?: string },
 ): string {
-  return `<!DOCTYPE html><html><head>
+  return `<!DOCTYPE html><html lang="${esc(pageLanguage())}"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>

@@ -17,6 +17,14 @@ import type { OneloEventStream } from './event-stream'
 import { classifyHandBack } from './hand-back'
 import type { PlanChange } from './plan-change'
 import { brandErrorPageHtml } from './brand-chrome'
+import {
+  PAGE_LANGUAGE_STORAGE_KEY,
+  adoptPageLanguage,
+  deviceAcceptLanguage,
+  oneloText,
+  pageLanguage,
+  requestLanguage,
+} from './text'
 
 // ── flowErrorHtml ────────────────────────────────────────────────────────────
 
@@ -39,28 +47,40 @@ import { brandErrorPageHtml } from './brand-chrome'
  */
 export function flowErrorHtml(t: BrandTokens = NEUTRAL_BRAND_TOKENS): string {
   return brandErrorPageHtml(t, {
-    title: "Couldn't start sign-in",
-    message: 'Something went wrong while connecting. Please check your connection and try again.',
+    // #1078: in the Page Language.
+    title: oneloText('signInFailedTitle'),
+    message: oneloText('signInFailedMessage'),
     retryHref: 'onelo-retry://retry',
   })
 }
 
 // ── resolveConfig ────────────────────────────────────────────────────────────
 
+/** The config this SDK resolved, plus the Page Language the backend chose for
+ *  its own texts (#1078) — null on an older backend or when it could not tell. */
+type ElectronResolvedConfig = ResolvedSDKConfig & { pageLanguage: string | null }
+
 async function resolveConfig(
   publishableKey: string,
   apiUrl: string,
   codeChallenge: string,
-  clientSecret?: string
-): Promise<ResolvedSDKConfig> {
+  clientSecret?: string,
+  appLanguage?: string,
+): Promise<ElectronResolvedConfig> {
   if (!publishableKey.startsWith('onelo_pk_')) {
     throw OneloError.invalidKey('Key must start with onelo_pk_')
   }
-  // #818: `lang` puts the sign-up Marketing Consent text in the device language.
-  const url = `${apiUrl}/api/sdk/config?key=${encodeURIComponent(publishableKey)}&code_challenge=${encodeURIComponent(codeChallenge)}${configLanguageParam()}`
-  const { status, json } = await httpGet(url, sdkHeaders(
-    clientSecret ? { 'X-Client-Secret': clientSecret } : undefined
-  ))
+  // #818: `lang` puts the sign-up Marketing Consent text in this language, and
+  // #1078: the backend answers the Page Language of this SDK's own texts
+  // (`page_language`) for it — the App's language, else the device language.
+  const url = `${apiUrl}/api/sdk/config?key=${encodeURIComponent(publishableKey)}&code_challenge=${encodeURIComponent(codeChallenge)}${configLanguageParam(requestLanguage(undefined, appLanguage))}`
+  const extra: Record<string, string> = {}
+  if (clientSecret) extra['X-Client-Secret'] = clientSecret
+  // #1078: when `lang` is not one of the App Languages, the backend tries the
+  // device's preferred languages next (ADR-0043), then the App's default.
+  const accept = await deviceAcceptLanguage()
+  if (accept) extra['Accept-Language'] = accept
+  const { status, json } = await httpGet(url, sdkHeaders(Object.keys(extra).length > 0 ? extra : undefined))
   if (status === 401 || status === 404) throw OneloError.invalidKey('Server rejected the key')
   if (status !== 200) throw OneloError.server(`Config request failed: HTTP ${status}`)
   const j = json as Record<string, unknown>
@@ -83,6 +103,7 @@ async function resolveConfig(
     pageBackgroundColor: brandTokens.page_bg,
     brandTokens,
     signupMarketingConsent: signupMarketingConsentFromConfig(j),
+    pageLanguage: typeof j['page_language'] === 'string' ? (j['page_language'] as string) : null,
   }
 }
 
@@ -132,6 +153,9 @@ export function isExpiredAuthError(err: string | null | undefined): boolean {
 
 // ── OneloElectronAuth ────────────────────────────────────────────────────────
 
+/** `appName` until `/api/sdk/config` or `/flow/init` names the App. */
+const DEFAULT_APP_NAME = 'App'
+
 /** Storage slot for the hosted-surface origin — the trust anchor for a
  *  deep-linked gate URL. Namespaced like the token keys so a `clear()` on
  *  sign-out takes it with everything else. */
@@ -163,7 +187,7 @@ export class OneloElectronAuth {
    * after the app was quit.
    */
   private flowVerifier: string | null = null
-  private resolvedConfig: ResolvedSDKConfig | null = null
+  private resolvedConfig: ElectronResolvedConfig | null = null
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null
   private refreshTimer: ReturnType<typeof setTimeout> | null = null
   private static readonly HEARTBEAT_MS = 13 * 60 * 1000
@@ -233,7 +257,7 @@ export class OneloElectronAuth {
   /** Whether the tenant's plan allows custom auth UI */
   allowCustomBranding = false
   /** App name from dashboard — shown in hosted sign-in UI */
-  appName: string = 'App'
+  appName: string = DEFAULT_APP_NAME
   /** App logo URL from dashboard — shown in hosted sign-in UI if set */
   appLogoUrl: string | null = null
   /** Plan-gated enabled OAuth providers (google/github/apple) from
@@ -254,8 +278,29 @@ export class OneloElectronAuth {
    */
   lastPresentedSurface: string | null = null
 
+  /**
+   * #1078 — the App's language for its App User (`OneloElectronConfig.language`),
+   * or undefined for the device language. Sent wherever the SDK asks for a Page
+   * Language: `/api/sdk/config` (this SDK's own texts), sign-in, store, upgrade,
+   * consent and waitlist calls that pass no language of their own.
+   */
+  readonly language: string | undefined
+
+  /**
+   * #1078 — the App User's Page Language (ADR-0043): the language this SDK
+   * draws its own texts in ("Try again", window titles, feature badges), the
+   * same one the Hosted Pages use. The App's language when it is one of the App
+   * Languages, else the device language when it is, else the App's default —
+   * chosen by the backend in `/api/sdk/config` and kept for the next launch.
+   * `"en"` until the first answer.
+   */
+  get pageLanguage(): string {
+    return pageLanguage()
+  }
+
   constructor(config: OneloElectronConfig) {
     this.storage = new SecureTokenStorage()
+    this.language = config.language || undefined
     this.protocol = config.protocol ?? 'onelo'
     this.apiUrl = config.apiUrl
     this.publishableKey = config.publishableKey
@@ -282,8 +327,15 @@ export class OneloElectronAuth {
       const verifier = generateCodeVerifier()
       this.pkceVerifier = verifier
       const challenge = await generateCodeChallenge(verifier)
-      const resolved = await resolveConfig(this.publishableKey, this.apiUrl, challenge, this.clientSecret)
+      // #1078 — the Page Language an earlier launch was answered, so a screen
+      // painted before (or without) this launch's config is already in it.
+      const kept = await Promise.resolve()
+        .then(() => this.storage.get(PAGE_LANGUAGE_STORAGE_KEY))
+        .catch(() => null)
+      if (!this.pageLanguageAnswered) adoptPageLanguage(kept)
+      const resolved = await resolveConfig(this.publishableKey, this.apiUrl, challenge, this.clientSecret, this.language)
       this.resolvedConfig = resolved
+      await this.adoptPageLanguageAnswer(resolved.pageLanguage, kept)
       this.brand.set(resolved.brandTokens)
       this.allowCustomBranding = resolved.allowCustomBranding
       this.paywallEnabled = resolved.paywallEnabled
@@ -306,6 +358,31 @@ export class OneloElectronAuth {
       }
       // Otherwise (e.g. transient network) a cached session may still be usable.
     }
+  }
+
+  /** The sign-in window's title: the App's name as written, or "Sign in" in
+   *  the Page Language while no name is known (#1078). */
+  private windowTitle(): string {
+    return this.appName && this.appName !== DEFAULT_APP_NAME ? this.appName : oneloText('signIn')
+  }
+
+  /** True once `/api/sdk/config` answered a Page Language in this process. */
+  private pageLanguageAnswered = false
+
+  /**
+   * Adopt the Page Language `/api/sdk/config` answered (#1078) and keep it for
+   * the next launch. Null (an older backend, or one that could not read the App
+   * Languages) keeps the current one. Keeping it is best-effort: storage
+   * unavailable only costs the next launch's first paint.
+   */
+  private async adoptPageLanguageAnswer(answer: string | null, kept: string | null): Promise<void> {
+    const adopted = adoptPageLanguage(answer)
+    if (!adopted) return
+    this.pageLanguageAnswered = true
+    if (adopted === kept) return
+    await Promise.resolve()
+      .then(() => this.storage.set(PAGE_LANGUAGE_STORAGE_KEY, adopted))
+      .catch(() => { /* best-effort */ })
   }
 
   private async waitReady(): Promise<void> {
@@ -947,7 +1024,7 @@ export class OneloElectronAuth {
           // before the hosted page paints. Parity with the portal window.
           backgroundColor: this.brand.current().page_bg,
           webPreferences: { nodeIntegration: false, contextIsolation: true },
-          title: title ?? this.appName ?? 'Sign in',
+          title: title ?? this.windowTitle(),
         })
 
         // Park from the moment the window opens, not just at the OAuth
@@ -1163,7 +1240,7 @@ export class OneloElectronAuth {
           // #681 — the error page's own ground (brand page_bg).
           backgroundColor: this.brand.current().page_bg,
           webPreferences: { nodeIntegration: false, contextIsolation: true },
-          title: this.appName ?? 'Sign in',
+          title: this.windowTitle(),
         })
 
         win.setMenuBarVisibility(false)
@@ -1249,8 +1326,10 @@ export class OneloElectronAuth {
     // (revalidateEntitlement); CORS on /api/sdk/* already allows Authorization.
     if (session?.accessToken) extra['Authorization'] = `Bearer ${session.accessToken}`
     const challenge = await this.beginFlowPkce()
+    // #1039: the App's language, else the device language (#1078); the backend
+    // picks the sign-in page's Page Language within the App Languages.
     const { status, json } = await httpGet(
-      `${this.apiUrl}/api/sdk/flow/init?key=${encodeURIComponent(this.publishableKey)}&callback_scheme=${encodeURIComponent(this.protocol)}&code_challenge=${encodeURIComponent(challenge)}`,
+      `${this.apiUrl}/api/sdk/flow/init?key=${encodeURIComponent(this.publishableKey)}&callback_scheme=${encodeURIComponent(this.protocol)}&code_challenge=${encodeURIComponent(challenge)}&lang=${encodeURIComponent(requestLanguage(undefined, this.language))}`,
       sdkHeaders(this.bundleId, extra),
     )
     if (status !== 200) {

@@ -1,4 +1,5 @@
 import { httpGet, extractErrorCode } from '@onelo/core'
+import { oneloText, requestLanguage } from './text'
 import { OneloError } from './types'
 import type { OneloElectronSession } from './types'
 import { sdkHeaders } from './sdk-headers'
@@ -62,17 +63,21 @@ export class OneloStore {
    * cold-start omits it. Mirrors Swift `initiateStoreFlow(lang:)`. Use for a custom
    * presentation; `open()`/`openInBrowser()` wrap it.
    *
+   * @param lang  The App's language for the store. Omitted, `OneloElectronConfig.language`
+   *   is sent, else the device language (#1039, #1078); the backend picks the
+   *   Page Language within the App Languages.
+   *
    * @throws OneloError('server_error') on `store_not_configured` (409) /
    *   `paywall_not_enabled` (403) — DO NOT open a window in that case — or any
    *   other non-200. `OneloError('invalid_publishable_key')` on 401.
    */
-  async initiateStoreFlow(lang = 'en'): Promise<string> {
+  async initiateStoreFlow(lang?: string): Promise<string> {
     const session = await this.auth.getSession()
     const initiateUrl =
       `${this.apiUrl}/api/sdk/paywall/store-initiate` +
       `?key=${encodeURIComponent(this.publishableKey)}` +
       `&callback_scheme=${encodeURIComponent(this.protocol)}` +
-      `&lang=${encodeURIComponent(lang)}`
+      `&lang=${encodeURIComponent(requestLanguage(lang, this.auth.language))}`
 
     const { status, json } = await httpGet(
       initiateUrl,
@@ -108,7 +113,8 @@ export class OneloStore {
   async open(parentWindow?: import('electron').BrowserWindow): Promise<OneloElectronSession | null> {
     const storeUrl = await this.initiateStoreFlow()
     // A dead link (#619) reopens the store on a fresh one, not on /flow/init.
-    return this.auth.presentHostedUrl(storeUrl, parentWindow, 'Store', () => this.initiateStoreFlow())
+    // #1078: the window's title in the Page Language.
+    return this.auth.presentHostedUrl(storeUrl, parentWindow, oneloText('store'), () => this.initiateStoreFlow())
   }
 
   /**
@@ -118,7 +124,7 @@ export class OneloStore {
    * via your deep-link scheme on completion; wire `app.on('open-url')` (macOS) /
    * `second-instance` (win/linux) to `auth.handleDeepLink(url)` to finish sign-in.
    */
-  async openInBrowser(lang = 'en'): Promise<void> {
+  async openInBrowser(lang?: string): Promise<void> {
     const storeUrl = await this.initiateStoreFlow(lang)
     const { shell } = await import('electron')
     await shell.openExternal(storeUrl)
@@ -134,12 +140,14 @@ export class OneloStore {
    * (purchase, plan switch, expired link) closes it and the app sees the new plan
    * — a system browser never reports back. Resolves when the window closes.
    *
+   * @param lang  The App's language for the page. Omitted, `OneloElectronConfig.language`
+   *   is sent, else the device language (#1039, #1078).
    * @param parentWindow  Pass your main window to present modally.
    * @throws OneloError('not_authenticated') when signed out (401) or
    *   `OneloError('server_error')` on `plan_not_purchasable` (404) /
    *   `callback_scheme_required` (400) / any other non-200.
    */
-  async openUpgrade(plan: string, lang = 'en', parentWindow?: import('electron').BrowserWindow): Promise<void> {
+  async openUpgrade(plan: string, lang?: string, parentWindow?: import('electron').BrowserWindow): Promise<void> {
     const session = await this.auth.getSession()
     if (!session) throw OneloError.notAuthenticated()
 
@@ -148,7 +156,7 @@ export class OneloStore {
       `?key=${encodeURIComponent(this.publishableKey)}` +
       `&plan=${encodeURIComponent(plan)}` +
       `&callback_scheme=${encodeURIComponent(this.protocol)}` +
-      `&lang=${encodeURIComponent(lang)}`
+      `&lang=${encodeURIComponent(requestLanguage(lang, this.auth.language))}`
 
     const { status, json } = await httpGet(
       initiateUrl,

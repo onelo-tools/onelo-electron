@@ -85,7 +85,7 @@ export class Onelo {
     this.feedback = new OneloFeedback({ publishableKey: config.publishableKey, apiUrl: config.apiUrl, bundleId: config.bundleId }, this.features, userToken)
     this.feedback.setBrandSource(this.auth.brand) // #681: one brand-token model
     this.forms = new OneloForms(config.apiUrl, config.publishableKey, config.bundleId)
-    this.waitlist = new OneloWaitlist(config.apiUrl, config.publishableKey, config.bundleId)
+    this.waitlist = new OneloWaitlist(config.apiUrl, config.publishableKey, config.bundleId, config.language)
     this.affiliates = new OneloAffiliates(
       config.publishableKey,
       affiliateStore(),
@@ -228,7 +228,7 @@ export class Onelo {
    * Thin delegate to {@link OneloStore.openUpgrade} for cross-platform parity with
    * Swift `Onelo.openUpgrade(forPlan:)` / Android / Flutter / RN `onelo.openUpgrade`.
    */
-  async openUpgrade(plan: string, lang = 'en', parentWindow?: import('electron').BrowserWindow): Promise<void> {
+  async openUpgrade(plan: string, lang?: string, parentWindow?: import('electron').BrowserWindow): Promise<void> {
     return this.store.openUpgrade(plan, lang, parentWindow)
   }
 

@@ -56,6 +56,16 @@ export interface OneloElectronConfig {
    */
   autoLifecycleRefresh?: boolean
   /**
+   * The App's language for its App User (a BCP 47 tag such as `"de"` or
+   * `"pt-PT"`), or omitted for the device language. The Hosted Pages and this
+   * SDK's own texts ("Try again", window titles, feature badges) use it when it
+   * is one of your App Languages; otherwise the device language when it is
+   * one, otherwise your App's default. A language passed to a single call
+   * (`store.openInBrowser('fr')`, `waitlist.join(…, { language })`) wins for
+   * that call. `onelo.auth.pageLanguage` tells you the language chosen (#1078).
+   */
+  language?: string
+  /**
    * Status returned by `onelo.features.feature(name)` for a slug not (yet) in the
    * resolved snapshot. Fail-closed 'hidden' by default — a feature instrumented in
    * code but not enabled in the dashboard stays hidden in production. Set 'enabled'

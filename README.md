@@ -123,6 +123,10 @@ The package also exports `IPC_CHANNELS`, a set of ready-made channel names for t
 
 `presentAuthWindow()` and `loadAuthView()` always open the Onelo-hosted sign-in page, on every plan. There is no inline form to configure and no intermediate screen — the hosted page opens as soon as the SDK is ready, and carries your branding.
 
+## Language
+
+The SDK's own texts (the "Try again" screens, the sign-in, store, feedback, account and consent window titles, the feature badges such as "Coming soon" and "Available in Pro") and the hosted pages it opens use the App User's Page Language. That is the language you pass with `new Onelo({ ..., language: 'de' })` when it is one of your App Languages, otherwise the device language when it is one, otherwise your App's default. Onelo chooses it and translates its own texts into English, Polish, German, French, Spanish, Italian, Portuguese and Dutch. Your own content (app name, plan names, your texts) is shown as written. `onelo.auth.pageLanguage` tells you the language chosen.
+
 ## Requirements
 
 - Electron **28 or newer** (declared as a peer dependency)

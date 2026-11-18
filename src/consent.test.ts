@@ -125,6 +125,18 @@ describe('OneloConsent.requiredConsents()', () => {
     expect(headers).toMatchObject({ Authorization: 'Bearer tok', 'X-Publishable-Key': 'onelo_pk_test' })
   })
 
+  it('#1073: sends the device language so the backend links the Page Language', async () => {
+    vi.stubGlobal('navigator', { language: 'de-DE' })
+    try {
+      const { consent } = makeConsent(SESSION)
+      ;(httpGet as any).mockResolvedValue({ status: 200, json: { required: [req()] } })
+      await consent.requiredConsents()
+      expect((httpGet as any).mock.calls[0][0]).toBe('https://api.example.com/v1/sdk/consent/required?lang=de-DE')
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
   it('is forward-compat: unknown enforcement → "unknown", missing blocking → false', async () => {
     const { consent } = makeConsent(SESSION)
     ;(httpGet as any).mockResolvedValue({
